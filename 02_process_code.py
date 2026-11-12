@@ -6,7 +6,6 @@ runnable snippet are still listed, for the metadata checks.
 Writes `execution/snippets.json`, which is consumed by `03_run_jobs.py`.
 """
 
-import ast
 import fnmatch
 import json
 import os
@@ -19,6 +18,7 @@ from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
 from configuration import AgentConfig
+from jobs import prepare_snippet
 from utilities import setup_logging
 
 load_dotenv()
@@ -84,35 +84,6 @@ def select_models(huggingface_api: HfApi, task: str, limit: int) -> list[str]:
         if len(selected) == limit:
             break
     return selected
-
-
-def prepare_snippet(code: str) -> str:
-    """Drops install lines and binds the snippet's final value to `_result` so the runner can inspect it."""
-    lines = [
-        line
-        for line in code.splitlines()
-        if not line.lstrip().startswith(("!", "# pip", "%pip"))
-    ]
-    tree = ast.parse("\n".join(lines))
-    if tree.body and isinstance(tree.body[-1], ast.Expr):
-        value = tree.body[-1].value
-        if (
-            isinstance(value, ast.Call)
-            and getattr(value.func, "id", None) == "print"
-            and value.args
-        ):
-            value = value.args[0]  # `print(x)` -> inspect x
-        tree.body[-1] = ast.Assign(
-            targets=[ast.Name(id="_result", ctx=ast.Store())], value=value
-        )
-        ast.fix_missing_locations(tree)
-    elif (
-        tree.body
-        and isinstance(tree.body[-1], ast.Assign)
-        and isinstance(tree.body[-1].targets[0], ast.Name)
-    ):
-        return f"{ast.unparse(tree)}\n_result = {tree.body[-1].targets[0].id}"
-    return ast.unparse(tree)
 
 
 def snippet_library(code: str) -> str | None:
