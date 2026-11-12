@@ -1,324 +1,220 @@
-import os
-import json
-from pathlib import Path
-from typing import List
-from dataclasses import dataclass, asdict
-import requests
-from datasets import Dataset, load_dataset
-from dotenv import load_dotenv
-from huggingface_hub import HfApi, upload_file
-from slack_sdk import WebClient
+"""
+Selects the top N trending models per task and collects their "Use this model"
+snippets for the libraries we can run (only when the model is tagged with that
+library), then estimates the hardware each model needs. Models without a
+runnable snippet are still listed, for the metadata checks.
+Writes `execution/snippets.json`, which is consumed by `03_run_jobs.py`.
+"""
 
-from configuration import SlackConfig, DatasetConfig
-from utilities import send_slack_message, setup_logging
+import ast
+import fnmatch
+import json
+import os
+import re
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+from huggingface_hub import HfApi
+
+from configuration import AgentConfig
+from utilities import setup_logging
 
 load_dotenv()
 logger = setup_logging(__name__)
 
-
-# Directory for storing generated code locally
-LOCAL_CODE_DIR = Path("code")
-LOCAL_CODE_DIR.mkdir(parents=True, exist_ok=True)
-
-# UV script header
-UV_SCRIPT_HEADER = """\
-# /// script
-# requires-python = ">=3.12"
-# dependencies = [
-#     "numpy",
-#     "einops",
-#     "pandas",
-#     "matplotlib",
-#     "protobuf",
-#     "torch",
-#     "sentencepiece",
-#     "torchvision",
-#     "transformers",
-#     "timm",
-#     "diffusers",
-#     "sentence-transformers",
-#     "accelerate",
-#     "peft",
-#     "slack-sdk",
-# ]
-# ///
-"""
+SNIPPETS_PATH = Path("execution/snippets.json")
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+DIFFUSERS_VARIANT = re.compile(r"\.(fp16|bf16|fp32|non_ema|ema)\.\w+$")
+# model tag -> module its snippets import; snippets are only run when the model has the tag
+RUNNABLE_LIBRARIES = {
+    "transformers": "transformers",
+    "diffusers": "diffusers",
+    "sentence-transformers": "sentence_transformers",
+    "gguf": "llama_cpp",
+}
+# not every job needs these, so they are installed per model inside the job
+LIBRARY_DEPENDENCIES = {
+    "gguf": ["llama-cpp-python"],
+}
 
 
 @dataclass
-class ModelCodeInfo:
+class ModelSnippets:
     id: str
-    scripts: str
-    code_urls: str
-    execution_urls: str
-    estimated_vram: float
+    task: str
+    snippets: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    weights_gb: float = 0.0
+    needs_fp8: bool = False
+    cpu_only: bool = False  # llama.cpp snippets run on CPU
+    skip_reason: str | None = None
 
 
-def estimate_model_vram(model_id: str, huggingface_api: HfApi) -> float:
+def list_tasks(config: AgentConfig) -> list[str]:
+    if config.tasks:
+        return config.tasks
+    return list(requests.get("https://huggingface.co/api/tasks", timeout=30).json())
+
+
+def has_discussions(huggingface_api: HfApi, model_id: str) -> bool:
     try:
-        model_info = huggingface_api.model_info(model_id)
-
-        if model_info.safetensors is None:
-            logger.warning(f"No safetensors info for {model_id}")
-            return 0.0
-
-        total_params = model_info.safetensors.total
-        param_dtypes = list(model_info.safetensors.parameters.keys())
-
-        primary_dtype = param_dtypes[0] if param_dtypes else "FP32"
-        bytes_per_param = 2 if "BF16" in primary_dtype or "FP16" in primary_dtype else 4
-
-        vram_gb = (total_params * bytes_per_param) / (1024**3)
-        return round(vram_gb * 1.3, 2)  # add 30% overhead
-
-    except Exception as e:
-        logger.error(f"Failed to estimate VRAM for {model_id}: {e}")
-        return 0.0
+        next(iter(huggingface_api.get_repo_discussions(model_id)), None)
+        return True
+    except Exception:
+        return False
 
 
-def fetch_notebook_content(model_id: str):
-    """Get the notebook contents from model id"""
-    url = f"https://huggingface.co/{model_id}.ipynb"
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return json.loads(response.text)
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch notebook for {model_id}: {e}")
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in notebook for {model_id}: {e}")
+def select_models(huggingface_api: HfApi, task: str, limit: int) -> list[str]:
+    """Top `limit` trending, non-gated models with a discussion tab, with their tags."""
+    selected = []
+    for model in huggingface_api.list_models(
+        pipeline_tag=task,
+        sort="trendingScore",
+        limit=limit * 4,  # some candidates are filtered out below
+        expand=["gated", "tags"],
+    ):
+        if model.gated:
+            continue
+        if not has_discussions(huggingface_api, model.id):
+            logger.info(f"Skipped {model.id}: no discussion tab")
+            continue
+        selected.append((model.id, model.tags or []))
+        if len(selected) == limit:
+            break
+    return selected
+
+
+def prepare_snippet(code: str) -> str:
+    """Drops install lines and binds the snippet's final value to `_result` so the runner can inspect it."""
+    lines = [
+        line
+        for line in code.splitlines()
+        if not line.lstrip().startswith(("!", "# pip", "%pip"))
+    ]
+    tree = ast.parse("\n".join(lines))
+    if tree.body and isinstance(tree.body[-1], ast.Expr):
+        value = tree.body[-1].value
+        if (
+            isinstance(value, ast.Call)
+            and getattr(value.func, "id", None) == "print"
+            and value.args
+        ):
+            value = value.args[0]  # `print(x)` -> inspect x
+        tree.body[-1] = ast.Assign(
+            targets=[ast.Name(id="_result", ctx=ast.Store())], value=value
+        )
+        ast.fix_missing_locations(tree)
+    elif (
+        tree.body
+        and isinstance(tree.body[-1], ast.Assign)
+        and isinstance(tree.body[-1].targets[0], ast.Name)
+    ):
+        return f"{ast.unparse(tree)}\n_result = {tree.body[-1].targets[0].id}"
+    return ast.unparse(tree)
+
+
+def snippet_library(code: str) -> str | None:
+    for tag, module in RUNNABLE_LIBRARIES.items():
+        if re.search(rf"^\s*(from|import) {module}\b", code, re.MULTILINE):
+            return tag
     return None
 
 
-def extract_code_cells(notebook: dict) -> List[str]:
-    "From the notebook extract only the code cells"
-    code_snippets = []
-    for cell in notebook.get("cells", []):
-        if cell.get("cell_type") != "code":
+def fetch_snippets(model_id: str, tags: list[str]) -> dict[str, list[str]]:
+    """
+    Runnable snippets from the model page's auto-generated notebook (the same
+    snippets as "Use this model"), keyed by library. A cell without imports
+    continues the previous snippet (e.g. llama.cpp's load cell, then its call cell).
+    """
+    response = requests.get(f"https://huggingface.co/{model_id}.ipynb", timeout=30)
+    response.raise_for_status()
+    snippets, current = {}, None
+    for cell in response.json().get("cells", []):
+        source = "".join(cell.get("source", []))
+        if cell.get("cell_type") != "code" or source.lstrip().startswith("!"):
             continue
-        cell_content = "".join(cell.get("source", [])).strip()
-        if (
-            "pip install" in cell_content
-            or "integration status" in cell_content
-            or "import os" in cell_content
-        ):
-            logger.warning(
-                f"`pip install`, `integration status unknown`, or `inference endpoints` so skipping"
-            )
+        library = snippet_library(source)
+        if library:
+            current = [source] if library in tags else None
+            if current:
+                snippets.setdefault(library, []).append(current)
+        elif current and "import" not in source:
+            current.append(source)
         else:
-            code_snippets.append(cell_content)
-    return code_snippets
+            current = None  # e.g. Inference Providers cells
+    return {
+        lib: [prepare_snippet("\n".join(parts)) for parts in group]
+        for lib, group in snippets.items()
+    }
 
 
-def wrap_code_snippet_for_execution(
-    code_content: str,
-    model_name: str,
-    snippet_index: int,
-    execution_dataset_id: str,
-    channel_name: str,
-) -> tuple[str, str]:
+def estimate_weights(
+    huggingface_api: HfApi, model_id: str, snippets: list[str]
+) -> tuple[float, bool]:
     """
-    Wraps the provided code content in a safe try/except/finally block
-    that logs results and uploads them to the Hugging Face dataset.
-
-    Returns:
-        wrapped_code (str): Executable Python script string
-        exec_file (str): Local filename used for logs
+    Weight size from file sizes (dtype agnostic) and whether the weights are FP8.
+    For GGUF repos only the files the snippets reference are counted.
     """
-    exec_file = f"{model_name}_{snippet_index}.txt"
-
-    template = """\
-try:
-{indented_code}
-    with open('{exec_file}', 'w', encoding='utf-8') as f:
-        f.write('Everything was good in {exec_file}')
-except Exception as e:
-    import os
-    from slack_sdk import WebClient
-    client = WebClient(token=os.environ['SLACK_TOKEN'])
-    client.chat_postMessage(
-        channel='{channel_name}',
-        text='Problem in <https://huggingface.co/datasets/{execution_dataset_id}/blob/main/{exec_file}|{exec_file}>',
-    )
-
-    with open('{exec_file}', 'a', encoding='utf-8') as f:
-        import traceback
-        f.write('''```CODE: \n{code_content}\n```\n\nERROR: \n''')
-        traceback.print_exc(file=f)
-    
-finally:
-    from huggingface_hub import upload_file
-    upload_file(
-        path_or_fileobj='{exec_file}',
-        repo_id='{execution_dataset_id}',
-        path_in_repo='{exec_file}',
-        repo_type='dataset',
-    )
-"""
-
-    # indent user code by 4 spaces
-    indented_code = "\n".join(
-        "    {}".format(line) for line in code_content.splitlines()
-    )
-
-    wrapped_code = template.format(
-        indented_code=indented_code,
-        exec_file=exec_file,
-        execution_dataset_id=execution_dataset_id,
-        channel_name=channel_name,
-        code_content=code_content,
-    )
-
-    return wrapped_code, exec_file
+    info = huggingface_api.model_info(model_id, files_metadata=True)
+    gguf_files = re.findall(r"filename=['\"]([^'\"]+)['\"]", "\n".join(snippets))
+    if gguf_files:
+        files = [
+            s
+            for s in info.siblings
+            if any(fnmatch.fnmatch(s.rfilename, g) for g in gguf_files)
+        ]
+    else:
+        files = [s for s in info.siblings if s.rfilename.endswith(WEIGHT_SUFFIXES)]
+        if any(f.rfilename.endswith(".safetensors") for f in files):
+            files = [f for f in files if f.rfilename.endswith(".safetensors")]
+        if any(s.rfilename == "model_index.json" for s in info.siblings):
+            # diffusers loads one copy of each component folder, not variants or single-file checkpoints
+            files = [
+                f
+                for f in files
+                if "/" in f.rfilename and not DIFFUSERS_VARIANT.search(f.rfilename)
+            ]
+    weights_gb = sum(f.size or 0 for f in files) / 1024**3
+    dtypes = info.safetensors.parameters if info.safetensors else {}
+    return round(weights_gb, 2), any(d.startswith("F8") for d in dtypes)
 
 
-def sanitize_model_name(model_id: str) -> str:
-    return "_".join(model_id.split("/"))
-
-
-def get_hf_dataset_url(dataset_id: str, filename: str) -> str:
-    return f"https://huggingface.co/datasets/{dataset_id}/raw/main/{filename}"
-
-
-def process_notebook_to_scripts(
-    model_name: str,
-    model_id: str,
-    ds_config: DatasetConfig,
-    channel_name: str,
-) -> List[str]:
-    notebook = fetch_notebook_content(model_id)
-    if not notebook:
-        logger.error(f"No notebook found for {model_id}")
-        return [], []
-
-    code_snippets = extract_code_cells(
-        notebook
-    )  # Extract only code cells, a list of snippets
-    if not code_snippets:
-        logger.error(f"No code cells found in notebook for {model_id}")
-        return [], []
-
-    processed_scripts = []
-    exec_files = []
-    for idx, snippet in enumerate(code_snippets):
-        wrapped_code, exec_file = wrap_code_snippet_for_execution(
-            code_content=snippet,
-            model_name=model_name,
-            snippet_index=idx,
-            execution_dataset_id=ds_config.code_execution_files_dataset_id,
-            channel_name=channel_name,
+def collect(
+    huggingface_api: HfApi, model_id: str, task: str, tags: list[str]
+) -> ModelSnippets:
+    result = ModelSnippets(id=model_id, task=task)
+    try:
+        by_library = fetch_snippets(model_id, tags)
+        result.snippets = [code for group in by_library.values() for code in group]
+        if not result.snippets:
+            result.skip_reason = "no runnable snippet for the model's libraries"
+            return result
+        result.dependencies = [
+            d for lib in by_library for d in LIBRARY_DEPENDENCIES.get(lib, [])
+        ]
+        result.cpu_only = list(by_library) == ["gguf"]
+        result.weights_gb, result.needs_fp8 = estimate_weights(
+            huggingface_api, model_id, result.snippets
         )
-        processed_scripts.append(UV_SCRIPT_HEADER + "\n" + wrapped_code)
-        exec_files.append(exec_file)
-
-    logger.info(f"Processed {len(processed_scripts)} scripts for {model_id}")
-    return processed_scripts, exec_files
-
-
-def process_models(
-    model_id: str,
-    ds_config: DatasetConfig,
-    huggingface_api: HfApi,
-    channel_name: str,
-    hf_token: str,
-) -> ModelCodeInfo:
-    model_name = sanitize_model_name(
-        model_id=model_id
-    )  # sanitize the name as it will be used as file name
-    estimated_vram = estimate_model_vram(
-        model_id=model_id, huggingface_api=huggingface_api
-    )  # get the estimated vram later used for deciding the machines to run the models on
-    processed_scripts, exec_files = process_notebook_to_scripts(
-        model_name=model_name,
-        model_id=model_id,
-        ds_config=ds_config,
-        channel_name=channel_name,
-    )
-
-    code_urls = []
-    execution_urls = []
-
-    for script, exec_file in zip(processed_scripts, exec_files):
-        if (
-            "⚠️ Type of model/library unknow" in script
-        ):  # This is hardcoded as sometimes you will not be able to get the script from the URL
-            code_urls.append("DO NOT EXECUTE")
-            execution_urls.append("WAS NOT EXECUTED")
-            continue
-
-        local_py_filename = exec_file.replace(".txt", ".py")
-        local_path = LOCAL_CODE_DIR / local_py_filename
-        local_path.write_text(script, encoding="utf-8")
-
-        upload_file(
-            repo_id=ds_config.code_python_files_dataset_id,
-            path_or_fileobj=local_path,
-            path_in_repo=local_py_filename,
-            repo_type="dataset",
-            token=hf_token,
-        )
-        logger.info(f"Uploaded: {local_py_filename}")
-
-        code_urls.append(
-            get_hf_dataset_url(
-                dataset_id=ds_config.code_python_files_dataset_id,
-                filename=local_py_filename,
-            )
-        )
-        execution_urls.append(
-            get_hf_dataset_url(
-                dataset_id=ds_config.code_execution_files_dataset_id,
-                filename=exec_file,
-            )
-        )
-
-    return ModelCodeInfo(
-        id=model_id,
-        estimated_vram=estimated_vram,
-        scripts=processed_scripts,
-        code_urls=code_urls,
-        execution_urls=execution_urls,
-    )
+    except Exception as e:
+        result.skip_reason = f"could not collect: {e}"
+    return result
 
 
 if __name__ == "__main__":
-    hf_token = os.environ["HF_TOKEN"]
-    slack_token = os.environ["SLACK_TOKEN"]
-    huggingface_api = HfApi(token=hf_token)
-    slack_client = WebClient(token=slack_token)
-    dataset_config = DatasetConfig()
-    slack_config = SlackConfig()
+    huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
+    agent_config = AgentConfig()
 
-    trending_models_metadata_ds = load_dataset(
-        dataset_config.trending_models_metadata_id, split="train", token=hf_token
-    )
+    results = []
+    for task in list_tasks(agent_config):
+        for model_id, tags in select_models(
+            huggingface_api, task, agent_config.num_trending_models_per_task
+        ):
+            results.append(asdict(collect(huggingface_api, model_id, task, tags)))
+            logger.info(f"Collected {model_id} ({task})")
 
-    # filter models to be executed:
-    # 1. gguf models
-    # 2. models with no discussion tab
-    # 3. if the repo has a notebook inside (this is meant to change later)
-    targeted_models = trending_models_metadata_ds.filter(
-        lambda x: not x["should_skip_code_exec"]
-    )["id"]
-
-    # could have used the threadpooler, but this function works on files (which is async)
-    dataset_rows = list()
-    for model_id in targeted_models:
-        model_code_info = process_models(
-            model_id=model_id,
-            ds_config=dataset_config,
-            huggingface_api=huggingface_api,
-            channel_name=slack_config.metadata_channel_name,
-            hf_token=hf_token,
-        )
-        dataset_rows.append(asdict(model_code_info))
-
-    model_code_info_ds = Dataset.from_list(dataset_rows)
-    model_code_info_ds.push_to_hub(
-        dataset_config.hf_jobs_url_dataset_id, token=hf_token
-    )
-    send_slack_message(
-        client=slack_client,
-        channel_name=slack_config.metadata_channel_name,
-        simple_text=f"HF Jobs URL Dataset Uploaded to <https://huggingface.co/datasets/{dataset_config.hf_jobs_url_dataset_id}|{dataset_config.hf_jobs_url_dataset_id}>",
-    )
+    SNIPPETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SNIPPETS_PATH.write_text(json.dumps(results, indent=2))
+    logger.info(f"Wrote {len(results)} models to {SNIPPETS_PATH}")
