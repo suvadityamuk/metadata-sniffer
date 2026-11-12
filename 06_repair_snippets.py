@@ -15,10 +15,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
-from configuration import AgentConfig, ExecuteCodeConfig
+from configuration import ExecuteCodeConfig
 from jobs import Budget, prepare_snippet, run_snippets
 from llm import ask_json
-from proposals import Proposal, add_proposals, load_vocabulary, open_pr
+from proposals import Proposal, load_vocabulary, submit
+from state import load_agent_config
 from utilities import (
     SlackMessage,
     SlackMessageType,
@@ -147,7 +148,10 @@ def to_proposal(model_id, fix, vocabulary) -> Proposal | None:
 
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
-    agent_config, execute_config = AgentConfig(), ExecuteCodeConfig()
+    agent_config, execute_config = (
+        load_agent_config(huggingface_api),
+        ExecuteCodeConfig(),
+    )
     budget = Budget.for_run(agent_config.max_cost_per_run_usd)
 
     collected = {m["id"]: m for m in json.loads(SNIPPETS_PATH.read_text())}
@@ -170,14 +174,12 @@ if __name__ == "__main__":
     new_proposals, template_alerts = [], []
     for (model_id, index), fix in fixed.items():
         if proposal := to_proposal(model_id, fix, vocabulary):
-            if agent_config.auto_open_prs:
-                logger.info(f"Opened {open_pr(huggingface_api, proposal)}")
             new_proposals.append(proposal)
         elif fix["cause"] == "snippet_template":
             template_alerts.append(
                 f"• <https://huggingface.co/{model_id}|{model_id}> snippet {index}: {fix['explanation']}\n```{fix['fixed_snippet']}```"
             )
-    add_proposals(new_proposals)
+    submit(huggingface_api, new_proposals, agent_config.auto_open_prs)
 
     if template_alerts:
         send_webhook_message(

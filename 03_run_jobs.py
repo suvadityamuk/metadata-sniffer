@@ -13,8 +13,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
-from configuration import AgentConfig, ExecuteCodeConfig
+from configuration import ExecuteCodeConfig
 from jobs import Budget, run_snippets
+from state import load_agent_config
 from utilities import (
     SlackMessage,
     SlackMessageType,
@@ -32,7 +33,7 @@ RESULTS_PATH = Path("execution/results.json")
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
     execute_config = ExecuteCodeConfig()
-    budget = Budget.for_run(AgentConfig().max_cost_per_run_usd)
+    budget = Budget.for_run(load_agent_config(huggingface_api).max_cost_per_run_usd)
 
     collected = json.loads(SNIPPETS_PATH.read_text())
     report = {

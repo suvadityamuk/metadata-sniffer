@@ -17,8 +17,10 @@ import requests
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
+import radar
 from configuration import AgentConfig
 from jobs import prepare_snippet
+from state import load_agent_config, read
 from utilities import setup_logging
 
 load_dotenv()
@@ -176,7 +178,7 @@ def collect(
 
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
-    agent_config = AgentConfig()
+    agent_config = load_agent_config(huggingface_api)
 
     results = []
     for task in list_tasks(agent_config):
@@ -185,6 +187,23 @@ if __name__ == "__main__":
         ):
             results.append(asdict(collect(huggingface_api, model_id, task, tags)))
             logger.info(f"Collected {model_id} ({task})")
+
+    # new repos of releases on Radar's calendar
+    calendar = read(huggingface_api, "radar.json", {}).get("calendar", "")
+    releases = radar.releases_to_watch(radar.parse_calendar(calendar), agent_config)
+    seen = {r["id"] for r in results}
+    for model_id in radar.new_models(huggingface_api, releases, agent_config):
+        info = huggingface_api.model_info(model_id)
+        if (
+            model_id in seen
+            or info.gated
+            or not has_discussions(huggingface_api, model_id)
+        ):
+            continue
+        results.append(
+            asdict(collect(huggingface_api, model_id, "radar", info.tags or []))
+        )
+        logger.info(f"Collected {model_id} (radar)")
 
     SNIPPETS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SNIPPETS_PATH.write_text(json.dumps(results, indent=2))
