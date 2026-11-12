@@ -13,6 +13,8 @@ import sys
 import time
 
 RESULT_MARKER = "SNIPPET_RESULT "
+# prebuilt CPU wheels, so llama-cpp-python does not have to be compiled in the job
+EXTRA_INDEX_URL = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
 OUTPUT_MARKER = "SNIPPET_OUTPUT "
 
 # Appended to each snippet: summarises `_result` (the snippet's trailing expression).
@@ -65,6 +67,20 @@ def run_snippet(code: str, timeout_s: int) -> dict:
 if __name__ == "__main__":
     batch = json.loads(base64.b64decode(os.environ["SNIPPET_BATCH"]))
     for model in batch:
+        if model.get("dependencies"):
+            subprocess.run(
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--python",
+                    sys.executable,
+                    "--extra-index-url",
+                    EXTRA_INDEX_URL,
+                    *model["dependencies"],
+                ],
+                check=False,
+            )
         for index, code in enumerate(model["snippets"]):
             result = {"id": model["id"], "index": index}
             result.update(run_snippet(code, model["timeout_s"]))

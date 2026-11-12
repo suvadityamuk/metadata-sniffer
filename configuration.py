@@ -43,6 +43,8 @@ class ExecuteCodeConfig:
     dependencies: List[str] = field(
         default_factory=lambda: [
             "transformers",
+            "diffusers",
+            "sentence-transformers",
             "torch",
             "torchvision",
             "torchaudio",

@@ -1,12 +1,16 @@
 """
-Collects the "Use this model -> Transformers" snippets of the top N trending
-transformers models per task and estimates the hardware each model needs.
+Selects the top N trending models per task and collects their "Use this model"
+snippets for the libraries we can run (only when the model is tagged with that
+library), then estimates the hardware each model needs. Models without a
+runnable snippet are still listed, for the metadata checks.
 Writes `execution/snippets.json`, which is consumed by `03_run_jobs.py`.
 """
 
 import ast
+import fnmatch
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -22,6 +26,18 @@ logger = setup_logging(__name__)
 
 SNIPPETS_PATH = Path("execution/snippets.json")
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+DIFFUSERS_VARIANT = re.compile(r"\.(fp16|bf16|fp32|non_ema|ema)\.\w+$")
+# model tag -> module its snippets import; snippets are only run when the model has the tag
+RUNNABLE_LIBRARIES = {
+    "transformers": "transformers",
+    "diffusers": "diffusers",
+    "sentence-transformers": "sentence_transformers",
+    "gguf": "llama_cpp",
+}
+# not every job needs these, so they are installed per model inside the job
+LIBRARY_DEPENDENCIES = {
+    "gguf": ["llama-cpp-python"],
+}
 
 
 @dataclass
@@ -29,8 +45,10 @@ class ModelSnippets:
     id: str
     task: str
     snippets: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
     weights_gb: float = 0.0
     needs_fp8: bool = False
+    cpu_only: bool = False  # llama.cpp snippets run on CPU
     skip_reason: str | None = None
 
 
@@ -49,28 +67,27 @@ def has_discussions(huggingface_api: HfApi, model_id: str) -> bool:
 
 
 def select_models(huggingface_api: HfApi, task: str, limit: int) -> list[str]:
-    """Top `limit` trending, public, non-gated transformers models with a discussion tab."""
+    """Top `limit` trending, non-gated models with a discussion tab, with their tags."""
     selected = []
     for model in huggingface_api.list_models(
         pipeline_tag=task,
-        filter="transformers",
         sort="trendingScore",
         limit=limit * 4,  # some candidates are filtered out below
-        expand=["gated", "library_name", "tags"],
+        expand=["gated", "tags"],
     ):
-        if model.gated or model.library_name != "transformers":
+        if model.gated:
             continue
         if not has_discussions(huggingface_api, model.id):
             logger.info(f"Skipped {model.id}: no discussion tab")
             continue
-        selected.append(model.id)
+        selected.append((model.id, model.tags or []))
         if len(selected) == limit:
             break
     return selected
 
 
 def prepare_snippet(code: str) -> str:
-    """Drops install lines and binds the trailing expression to `_result` so the runner can inspect it."""
+    """Drops install lines and binds the snippet's final value to `_result` so the runner can inspect it."""
     lines = [
         line
         for line in code.splitlines()
@@ -78,49 +95,111 @@ def prepare_snippet(code: str) -> str:
     ]
     tree = ast.parse("\n".join(lines))
     if tree.body and isinstance(tree.body[-1], ast.Expr):
-        last = tree.body[-1]
+        value = tree.body[-1].value
+        if (
+            isinstance(value, ast.Call)
+            and getattr(value.func, "id", None) == "print"
+            and value.args
+        ):
+            value = value.args[0]  # `print(x)` -> inspect x
         tree.body[-1] = ast.Assign(
-            targets=[ast.Name(id="_result", ctx=ast.Store())], value=last.value
+            targets=[ast.Name(id="_result", ctx=ast.Store())], value=value
         )
         ast.fix_missing_locations(tree)
+    elif (
+        tree.body
+        and isinstance(tree.body[-1], ast.Assign)
+        and isinstance(tree.body[-1].targets[0], ast.Name)
+    ):
+        return f"{ast.unparse(tree)}\n_result = {tree.body[-1].targets[0].id}"
     return ast.unparse(tree)
 
 
-def fetch_transformers_snippets(model_id: str) -> list[str]:
-    """The model page's auto-generated notebook holds the same snippets as "Use this model"."""
+def snippet_library(code: str) -> str | None:
+    for tag, module in RUNNABLE_LIBRARIES.items():
+        if re.search(rf"^\s*(from|import) {module}\b", code, re.MULTILINE):
+            return tag
+    return None
+
+
+def fetch_snippets(model_id: str, tags: list[str]) -> dict[str, list[str]]:
+    """
+    Runnable snippets from the model page's auto-generated notebook (the same
+    snippets as "Use this model"), keyed by library. A cell without imports
+    continues the previous snippet (e.g. llama.cpp's load cell, then its call cell).
+    """
     response = requests.get(f"https://huggingface.co/{model_id}.ipynb", timeout=30)
     response.raise_for_status()
-    snippets = []
+    snippets, current = {}, None
     for cell in response.json().get("cells", []):
         source = "".join(cell.get("source", []))
-        if cell.get("cell_type") == "code" and "from transformers" in source:
-            snippets.append(prepare_snippet(source))
-    return snippets
+        if cell.get("cell_type") != "code" or source.lstrip().startswith("!"):
+            continue
+        library = snippet_library(source)
+        if library:
+            current = [source] if library in tags else None
+            if current:
+                snippets.setdefault(library, []).append(current)
+        elif current and "import" not in source:
+            current.append(source)
+        else:
+            current = None  # e.g. Inference Providers cells
+    return {
+        lib: [prepare_snippet("\n".join(parts)) for parts in group]
+        for lib, group in snippets.items()
+    }
 
 
-def estimate_weights(huggingface_api: HfApi, model_id: str) -> tuple[float, bool]:
-    """Weight size from file sizes (dtype agnostic) and whether the weights are FP8."""
+def estimate_weights(
+    huggingface_api: HfApi, model_id: str, snippets: list[str]
+) -> tuple[float, bool]:
+    """
+    Weight size from file sizes (dtype agnostic) and whether the weights are FP8.
+    For GGUF repos only the files the snippets reference are counted.
+    """
     info = huggingface_api.model_info(model_id, files_metadata=True)
-    files = [s for s in info.siblings if s.rfilename.endswith(WEIGHT_SUFFIXES)]
-    if any(f.rfilename.endswith(".safetensors") for f in files):
-        files = [f for f in files if f.rfilename.endswith(".safetensors")]
+    gguf_files = re.findall(r"filename=['\"]([^'\"]+)['\"]", "\n".join(snippets))
+    if gguf_files:
+        files = [
+            s
+            for s in info.siblings
+            if any(fnmatch.fnmatch(s.rfilename, g) for g in gguf_files)
+        ]
+    else:
+        files = [s for s in info.siblings if s.rfilename.endswith(WEIGHT_SUFFIXES)]
+        if any(f.rfilename.endswith(".safetensors") for f in files):
+            files = [f for f in files if f.rfilename.endswith(".safetensors")]
+        if any(s.rfilename == "model_index.json" for s in info.siblings):
+            # diffusers loads one copy of each component folder, not variants or single-file checkpoints
+            files = [
+                f
+                for f in files
+                if "/" in f.rfilename and not DIFFUSERS_VARIANT.search(f.rfilename)
+            ]
     weights_gb = sum(f.size or 0 for f in files) / 1024**3
     dtypes = info.safetensors.parameters if info.safetensors else {}
     return round(weights_gb, 2), any(d.startswith("F8") for d in dtypes)
 
 
-def collect(huggingface_api: HfApi, model_id: str, task: str) -> ModelSnippets:
+def collect(
+    huggingface_api: HfApi, model_id: str, task: str, tags: list[str]
+) -> ModelSnippets:
     result = ModelSnippets(id=model_id, task=task)
     try:
-        result.snippets = fetch_transformers_snippets(model_id)
+        by_library = fetch_snippets(model_id, tags)
+        result.snippets = [code for group in by_library.values() for code in group]
+        if not result.snippets:
+            result.skip_reason = "no runnable snippet for the model's libraries"
+            return result
+        result.dependencies = [
+            d for lib in by_library for d in LIBRARY_DEPENDENCIES.get(lib, [])
+        ]
+        result.cpu_only = list(by_library) == ["gguf"]
         result.weights_gb, result.needs_fp8 = estimate_weights(
-            huggingface_api, model_id
+            huggingface_api, model_id, result.snippets
         )
     except Exception as e:
         result.skip_reason = f"could not collect: {e}"
-        return result
-    if not result.snippets:
-        result.skip_reason = "no transformers snippet"
     return result
 
 
@@ -130,10 +209,10 @@ if __name__ == "__main__":
 
     results = []
     for task in list_tasks(agent_config):
-        for model_id in select_models(
+        for model_id, tags in select_models(
             huggingface_api, task, agent_config.num_trending_models_per_task
         ):
-            results.append(asdict(collect(huggingface_api, model_id, task)))
+            results.append(asdict(collect(huggingface_api, model_id, task, tags)))
             logger.info(f"Collected {model_id} ({task})")
 
     SNIPPETS_PATH.parent.mkdir(parents=True, exist_ok=True)
