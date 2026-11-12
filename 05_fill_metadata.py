@@ -10,6 +10,7 @@ is never changed. Proposals go to `execution/proposals.json`.
 import json
 import os
 import re
+from pathlib import Path
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, ModelCard
@@ -24,6 +25,7 @@ load_dotenv()
 logger = setup_logging(__name__)
 
 SNIPPETS_PATH = "execution/snippets.json"
+METADATA_DONE_PATH = Path("execution/metadata_done.json")
 FIELDS = (
     "base_model",
     "datasets",
@@ -205,8 +207,14 @@ if __name__ == "__main__":
     vocabulary = load_vocabulary()
 
     model_ids = [m["id"] for m in json.load(open(SNIPPETS_PATH))]
-    new_proposals = []
+    new_proposals, done = [], []
     for model_id in model_ids:
+        if budget.reserved_usd + agent_config.llm_max_call_usd > budget.cap_usd:
+            logger.warning(
+                f"Cost cap reached, {len(model_ids) - len(done)} models left for the next run"
+            )
+            break
+        done.append(model_id)
         try:
             proposal = propose(
                 model_id, huggingface_api, vocabulary, budget, agent_config
@@ -219,3 +227,4 @@ if __name__ == "__main__":
         logger.info(f"{model_id}: proposing {list(proposal.metadata)}")
         new_proposals.append(proposal)
     submit(huggingface_api, new_proposals, agent_config.auto_open_prs)
+    METADATA_DONE_PATH.write_text(json.dumps(done))

@@ -44,15 +44,29 @@ def load_vocabulary() -> dict[str, set[str]]:
     }
 
 
-def has_open_team_pr(huggingface_api: HfApi, model_id: str) -> bool:
+def covered_by_open_pr(huggingface_api: HfApi, proposal: Proposal) -> bool:
+    """An open PR by the team or the agent already changes one of the proposal's fields."""
     team = {
         *ModelCheckerConfig().avocado_team_members,
         huggingface_api.whoami()["name"],
     }
-    return any(
-        d.is_pull_request and d.status == "open" and d.author in team
-        for d in huggingface_api.get_repo_discussions(model_id)
-    )
+    for discussion in huggingface_api.get_repo_discussions(proposal.model_id):
+        if not (
+            discussion.is_pull_request
+            and discussion.status == "open"
+            and discussion.author in team
+        ):
+            continue
+        diff = (
+            huggingface_api.get_discussion_details(
+                proposal.model_id, discussion.num
+            ).diff
+            or ""
+        )
+        changed = "\n".join(line for line in diff.splitlines() if line[:1] in "+-")
+        if any(f"{field}:" in changed for field in proposal.metadata):
+            return True
+    return False
 
 
 def open_pr(huggingface_api: HfApi, proposal: Proposal) -> str:
@@ -118,8 +132,7 @@ def submit(huggingface_api: HfApi, new: list[Proposal], auto_open: bool):
     for proposal in new:
         entry = asdict(proposal)
         if key(entry) in seen or (
-            proposal.pr_num is None
-            and has_open_team_pr(huggingface_api, proposal.model_id)
+            proposal.pr_num is None and covered_by_open_pr(huggingface_api, proposal)
         ):
             continue
         seen.add(key(entry))

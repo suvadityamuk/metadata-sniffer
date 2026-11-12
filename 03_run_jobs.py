@@ -2,12 +2,12 @@
 Runs the snippets collected by `02_process_code.py` on HF Jobs.
 Models are grouped by the cheapest flavor that fits them and each group runs in
 a single job (split when it would exceed `max_job_minutes`). Jobs are only
-launched while the per-run cost cap allows it. Writes `execution/results.json`.
+launched while the per-run cost cap allows it. Writes `execution/results.json`,
+which `08_report.py` reports.
 """
 
 import json
 import os
-from collections import Counter
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,12 +16,7 @@ from huggingface_hub import HfApi
 from configuration import ExecuteCodeConfig
 from jobs import Budget, run_snippets
 from state import load_agent_config
-from utilities import (
-    SlackMessage,
-    SlackMessageType,
-    send_webhook_message,
-    setup_logging,
-)
+from utilities import setup_logging
 
 load_dotenv()
 logger = setup_logging(__name__)
@@ -51,23 +46,3 @@ if __name__ == "__main__":
         }
 
     RESULTS_PATH.write_text(json.dumps(report, indent=2))
-
-    counts = Counter(entry["status"] for entry in report.values())
-    failed = [
-        f"• <https://huggingface.co/{mid}|{mid}>: {e['problems'][0]}"
-        for mid, e in report.items()
-        if e["status"] == "failed"
-    ]
-    send_webhook_message(
-        os.environ["EXP_SLACK_WEBHOOK_URL"],
-        [
-            SlackMessage(text="Snippet checks", msg_type=SlackMessageType.HEADER),
-            SlackMessage(
-                text=f"{dict(counts)} · reserved ${budget.reserved_usd:.2f} of ${budget.cap_usd:.2f}"
-            ),
-            *[
-                SlackMessage(text="\n".join(failed[i : i + 20]))
-                for i in range(0, len(failed), 20)
-            ],
-        ],
-    )

@@ -5,7 +5,7 @@ re-run on HF Jobs, `max_snippet_runs` runs in total including the original.
 A fix that runs is turned into:
 - a PR proposal, when the cause is the model's metadata (the Hub generates the
   snippet from it, e.g. a wrong pipeline_tag gives a wrong pipeline snippet), or
-- a huggingface.js alert in Slack, when the snippet template itself is wrong.
+- a huggingface.js alert in the run report, when the snippet template itself is wrong.
 """
 
 import json
@@ -16,14 +16,11 @@ from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
 from configuration import ExecuteCodeConfig
-from jobs import Budget, prepare_snippet, run_snippets
+from jobs import Budget, exception_line, prepare_snippet, run_snippets
 from llm import ask_json
 from proposals import Proposal, load_vocabulary, submit
 from state import load_agent_config
 from utilities import (
-    SlackMessage,
-    SlackMessageType,
-    send_webhook_message,
     setup_logging,
 )
 
@@ -33,6 +30,9 @@ logger = setup_logging(__name__)
 SNIPPETS_PATH = Path("execution/snippets.json")
 RESULTS_PATH = Path("execution/results.json")
 REPAIRS_PATH = Path("execution/repairs.json")
+TEMPLATE_ALERTS_PATH = Path(
+    "execution/template_alerts.json"
+)  # reported by 08_report.py
 FIXABLE_METADATA = ("pipeline_tag", "library_name")
 
 SYSTEM_PROMPT = """You fix Hugging Face "Use this model" code snippets that fail to run.
@@ -63,9 +63,15 @@ def diagnose(huggingface_api, model, failure, attempts, budget, config) -> dict 
         "error": failure["error"],
         "previous_attempts": attempts,
     }
-    return ask_json(
+    answer = ask_json(
         SYSTEM_PROMPT, json.dumps(context, indent=2, default=str), budget, config
     )
+    if answer:
+        answer["current_metadata"] = {
+            "pipeline_tag": info.pipeline_tag,
+            "library_name": info.library_name,
+        }
+    return answer
 
 
 def repair(
@@ -112,7 +118,11 @@ def repair(
             model_id, index = run_id.rsplit("#", 1)
             key = (model_id, int(index))
             if entry["status"] == "ok":
-                fixed[key] = {**candidates[key], "job_id": entry["job_id"]}
+                fixed[key] = {
+                    **candidates[key],
+                    "job_id": entry["job_id"],
+                    "original_error": exception_line(failures[key]["error"]),
+                }
             else:
                 result = (entry.get("results") or [{}])[0]
                 attempts[key].append(
@@ -132,17 +142,23 @@ def to_proposal(model_id, fix, vocabulary) -> Proposal | None:
     }
     if fix["cause"] != "metadata" or not metadata:
         return None
-    changes = ", ".join(f"`{k}` → `{v}`" for k, v in metadata.items())
+    # only verified facts go into the public PR: the error, the change, and the snippet that ran
+    changes = ", ".join(
+        f"`{k}` from `{fix['current_metadata'].get(k)}` to `{v}`"
+        for k, v in metadata.items()
+    )
+    with_metadata = ", ".join(f"`{k}: {v}`" for k, v in metadata.items())
+    job_url = f"https://huggingface.co/jobs/{ExecuteCodeConfig().jobs_namespace}/{fix['job_id']}"
     return Proposal(
         model_id=model_id,
         kind="snippet",
         metadata=metadata,
         overwrite=True,
         title=f"Fix the 'Use this model' snippet: set {', '.join(metadata)}",
-        description=f"The code snippet the Hub shows under *Use this model* currently fails. {fix['explanation']}\n\n"
-        f"This PR sets {changes}, which makes the Hub generate the snippet below. "
-        f"We ran it on [HF Jobs](https://huggingface.co/jobs/{ExecuteCodeConfig().jobs_namespace}/{fix['job_id']}) and it works:\n\n"
-        f"```python\n{fix['fixed_snippet']}\n```\n\nOpened by the Hugging Face metadata agent, feedback welcome!",
+        description=f"The *Use this model* snippet of this model currently fails with:\n\n```\n{fix['original_error']}\n```\n\n"
+        f"With {with_metadata}, the snippet below runs successfully on [HF Jobs]({job_url}):\n\n"
+        f"```python\n{fix['fixed_snippet']}\n```\n\n"
+        f"This PR changes {changes}. Opened by the Hugging Face metadata agent, feedback welcome!",
     )
 
 
@@ -180,15 +196,4 @@ if __name__ == "__main__":
                 f"• <https://huggingface.co/{model_id}|{model_id}> snippet {index}: {fix['explanation']}\n```{fix['fixed_snippet']}```"
             )
     submit(huggingface_api, new_proposals, agent_config.auto_open_prs)
-
-    if template_alerts:
-        send_webhook_message(
-            os.environ["EXP_SLACK_WEBHOOK_URL"],
-            [
-                SlackMessage(
-                    text="huggingface.js snippet fixes needed",
-                    msg_type=SlackMessageType.HEADER,
-                ),
-                *[SlackMessage(text=alert[:2900]) for alert in template_alerts],
-            ],
-        )
+    TEMPLATE_ALERTS_PATH.write_text(json.dumps(template_alerts))

@@ -11,6 +11,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -46,6 +47,7 @@ LIBRARY_DEPENDENCIES = {
 class ModelSnippets:
     id: str
     task: str
+    sha: str
     snippets: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     weights_gb: float = 0.0
@@ -68,22 +70,41 @@ def has_discussions(huggingface_api: HfApi, model_id: str) -> bool:
         return False
 
 
-def select_models(huggingface_api: HfApi, task: str, limit: int) -> list[str]:
-    """Top `limit` trending, non-gated models with a discussion tab, with their tags."""
-    selected = []
+def recently_checked(checked: dict, model_id: str, sha: str, days: int) -> bool:
+    """Checked within `days` days and unchanged since (same commit)."""
+    entry = checked.get(model_id)
+    if not entry or entry["sha"] != sha:
+        return False
+    return datetime.now(timezone.utc) - datetime.fromisoformat(
+        entry["date"]
+    ) < timedelta(days=days)
+
+
+def select_models(
+    huggingface_api: HfApi, task: str, limit: int, checked: dict, recheck_days: int
+) -> list:
+    """
+    Top `limit` trending, non-gated models with a discussion tab, as (id, tags, sha).
+    Recently checked, unchanged models keep their place in the top `limit` but are not checked again.
+    """
+    selected, taken = [], 0
     for model in huggingface_api.list_models(
         pipeline_tag=task,
         sort="trendingScore",
         limit=limit * 4,  # some candidates are filtered out below
-        expand=["gated", "tags"],
+        expand=["gated", "tags", "sha"],
     ):
         if model.gated:
             continue
         if not has_discussions(huggingface_api, model.id):
             logger.info(f"Skipped {model.id}: no discussion tab")
             continue
-        selected.append((model.id, model.tags or []))
-        if len(selected) == limit:
+        taken += 1
+        if recently_checked(checked, model.id, model.sha, recheck_days):
+            logger.info(f"Skipped {model.id}: checked recently, unchanged")
+        else:
+            selected.append((model.id, model.tags or [], model.sha))
+        if taken == limit:
             break
     return selected
 
@@ -155,9 +176,9 @@ def estimate_weights(
 
 
 def collect(
-    huggingface_api: HfApi, model_id: str, task: str, tags: list[str]
+    huggingface_api: HfApi, model_id: str, task: str, tags: list[str], sha: str
 ) -> ModelSnippets:
-    result = ModelSnippets(id=model_id, task=task)
+    result = ModelSnippets(id=model_id, task=task, sha=sha)
     try:
         by_library = fetch_snippets(model_id, tags)
         result.snippets = [code for group in by_library.values() for code in group]
@@ -179,13 +200,18 @@ def collect(
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
     agent_config = load_agent_config(huggingface_api)
+    checked = read(huggingface_api, "checked.json", {})
 
     results = []
     for task in list_tasks(agent_config):
-        for model_id, tags in select_models(
-            huggingface_api, task, agent_config.num_trending_models_per_task
+        for model_id, tags, sha in select_models(
+            huggingface_api,
+            task,
+            agent_config.num_trending_models_per_task,
+            checked,
+            agent_config.recheck_after_days,
         ):
-            results.append(asdict(collect(huggingface_api, model_id, task, tags)))
+            results.append(asdict(collect(huggingface_api, model_id, task, tags, sha)))
             logger.info(f"Collected {model_id} ({task})")
 
     # new repos of releases on Radar's calendar
@@ -197,11 +223,16 @@ if __name__ == "__main__":
         if (
             model_id in seen
             or info.gated
+            or recently_checked(
+                checked, model_id, info.sha, agent_config.recheck_after_days
+            )
             or not has_discussions(huggingface_api, model_id)
         ):
             continue
         results.append(
-            asdict(collect(huggingface_api, model_id, "radar", info.tags or []))
+            asdict(
+                collect(huggingface_api, model_id, "radar", info.tags or [], info.sha)
+            )
         )
         logger.info(f"Collected {model_id} (radar)")
 

@@ -8,7 +8,7 @@ trending models. Release orgs are mapped to Hub accounts via
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from huggingface_hub import HfApi
 
@@ -18,8 +18,8 @@ from utilities import setup_logging
 logger = setup_logging(__name__)
 
 ROW = re.compile(
-    r"(?P<date>~?(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [\d–-]+/\d+|TBD)\s+"
-    r"(?P<when>today|in \d+d|\d+d ago)?\s*"
+    r"(?P<date>~?(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?P<day>\d+)(?:[–-]\d+)?/(?P<month>\d+)|TBD)\s+"
+    r"(?:today|in \d+d|\d+d ago)?\s*"
     r":(?P<pr_status>[a-z_]+): (?P<name>[^·:]+?)\s*(?:\((?P<org>[^()]+)\))?\s*·"
 )
 
@@ -31,18 +31,20 @@ class Release:
     days_from_today: int | None  # None: no date yet
 
 
-def parse_calendar(text: str) -> list[Release]:
+def _days_from_today(day: int, month: int, today: date) -> int:
+    """Rows carry no year: pick the year that puts the date closest to today."""
+    candidates = [date(today.year + offset, month, day) for offset in (-1, 0, 1)]
+    return min(((d - today).days for d in candidates), key=abs)
+
+
+def parse_calendar(text: str, today: date | None = None) -> list[Release]:
+    """Uses each row's absolute date (start of a range), so a stored calendar never goes stale."""
+    today = today or datetime.now(timezone.utc).date()
     releases = []
     for match in ROW.finditer(text):
-        when = match["when"]
-        if when is None:
-            days = None
-        elif when == "today":
-            days = 0
-        elif when.startswith("in "):
-            days = int(when[3:-1])
-        else:
-            days = -int(when.split("d")[0])
+        days = None
+        if match["day"]:
+            days = _days_from_today(int(match["day"]), int(match["month"]), today)
         releases.append(Release(match["name"].strip(), match["org"], days))
     return releases
 

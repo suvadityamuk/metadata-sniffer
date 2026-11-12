@@ -114,6 +114,10 @@ if __name__ == "__main__":
             )
         except Exception as e:
             logger.error(f"{pr['model_id']}#{pr['num']}: {e}")
-    write(huggingface_api, "prs.json", prs, "Refresh tracked PRs")
+    # the Space may have opened PRs while this ran: merge into the latest list
+    refreshed = {(pr["model_id"], pr["num"]): pr for pr in prs}
+    latest = read(huggingface_api, "prs.json", [])
+    merged = [refreshed.get((pr["model_id"], pr["num"]), pr) for pr in latest]
+    write(huggingface_api, "prs.json", merged, "Refresh tracked PRs")
 
     submit(huggingface_api, follow_ups, agent_config.auto_open_prs)
