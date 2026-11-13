@@ -10,20 +10,22 @@ is never changed. Proposals go to `execution/proposals.json`.
 import json
 import os
 import re
+from pathlib import Path
 
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, ModelCard
 
-from configuration import AgentConfig
 from jobs import Budget
 from llm import ask_json
-from proposals import Proposal, add_proposals, load_vocabulary, open_pr
+from proposals import Proposal, load_vocabulary, submit
+from state import load_agent_config
 from utilities import setup_logging
 
 load_dotenv()
 logger = setup_logging(__name__)
 
 SNIPPETS_PATH = "execution/snippets.json"
+METADATA_DONE_PATH = Path("execution/metadata_done.json")
 FIELDS = (
     "base_model",
     "datasets",
@@ -115,14 +117,23 @@ def verify(field, value, readme, huggingface_api, vocabulary):
     elif field == "tags":
         kept = [v for v in as_list if isinstance(v, str) and _norm(v) in _norm(readme)]
     elif field == "model-index":
-        # every reported number must appear in the README
-        numbers = [
-            str(m.get("value"))
-            for entry in as_list
-            for r in entry.get("results", [])
-            for m in r.get("metrics", [])
-        ]
-        return value if numbers and all(n in readme for n in numbers) else None
+        # every result must name a Hub dataset from the README, a valid metric id and a number from the README
+        results = [r for entry in as_list for r in entry.get("results", [])]
+        valid = results and all(
+            resolve_repo(
+                huggingface_api,
+                str(r.get("dataset", {}).get("type")),
+                readme,
+                "dataset",
+            )
+            and r.get("metrics")
+            and all(
+                m.get("type") in vocabulary["metrics"] and str(m.get("value")) in readme
+                for m in r["metrics"]
+            )
+            for r in results
+        )
+        return value if valid else None
     return kept or None
 
 
@@ -191,13 +202,19 @@ def propose(model_id, huggingface_api, vocabulary, budget, config) -> Proposal |
 
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
-    agent_config = AgentConfig()
+    agent_config = load_agent_config(huggingface_api)
     budget = Budget.for_run(agent_config.max_cost_per_run_usd)
     vocabulary = load_vocabulary()
 
     model_ids = [m["id"] for m in json.load(open(SNIPPETS_PATH))]
-    new_proposals = []
+    new_proposals, done = [], []
     for model_id in model_ids:
+        if budget.reserved_usd + agent_config.llm_max_call_usd > budget.cap_usd:
+            logger.warning(
+                f"Cost cap reached, {len(model_ids) - len(done)} models left for the next run"
+            )
+            break
+        done.append(model_id)
         try:
             proposal = propose(
                 model_id, huggingface_api, vocabulary, budget, agent_config
@@ -208,7 +225,6 @@ if __name__ == "__main__":
         if proposal is None:
             continue
         logger.info(f"{model_id}: proposing {list(proposal.metadata)}")
-        if agent_config.auto_open_prs:
-            logger.info(f"Opened {open_pr(huggingface_api, proposal)}")
         new_proposals.append(proposal)
-    add_proposals(new_proposals)
+    submit(huggingface_api, new_proposals, agent_config.auto_open_prs)
+    METADATA_DONE_PATH.write_text(json.dumps(done))
