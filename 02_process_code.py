@@ -215,7 +215,11 @@ if __name__ == "__main__":
             logger.info(f"Collected {model_id} ({task})")
 
     # new repos of releases on Radar's calendar
-    calendar = read(huggingface_api, "radar.json", {}).get("calendar", "")
+    calendar = (
+        read(huggingface_api, "radar.json", {}).get("calendar", "")
+        if agent_config.radar_enabled
+        else ""
+    )
     releases = radar.releases_to_watch(radar.parse_calendar(calendar), agent_config)
     seen = {r["id"] for r in results}
     for model_id in radar.new_models(huggingface_api, releases, agent_config):

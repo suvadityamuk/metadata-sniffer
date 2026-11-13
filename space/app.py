@@ -1,7 +1,7 @@
 """
 Approval Space for the metadata agent (sign in with Hugging Face; only
 `AgentConfig.operators` may act): approve or reject proposed PRs, change the
-agent's toggles, paste Radar's release calendar, and start a run now.
+agent's toggles, and start a run now.
 """
 
 import json
@@ -87,17 +87,6 @@ def save_settings(auto_open, per_task, cap, tasks, profile: gr.OAuthProfile | No
     return "Saved"
 
 
-def save_radar(text, profile: gr.OAuthProfile | None):
-    _check(profile)
-    write(
-        huggingface_api,
-        "radar.json",
-        {"calendar": text},
-        f"Radar calendar from {profile.username}",
-    )
-    return "Saved, used by the next run"
-
-
 def run_now(profile: gr.OAuthProfile | None):
     _check(profile)
     job = launch_run(huggingface_api, load_agent_config(huggingface_api))
@@ -135,14 +124,6 @@ with gr.Blocks(title="Metadata agent") as demo:
         )
         saved = gr.Markdown()
         gr.Button("Save").click(save_settings, [auto_open, per_task, cap, tasks], saved)
-    with gr.Tab("Radar"):
-        calendar = gr.Textbox(
-            read(huggingface_api, "radar.json", {}).get("calendar", ""),
-            lines=15,
-            label="Paste Radar's release calendar",
-        )
-        radar_saved = gr.Markdown()
-        gr.Button("Save").click(save_radar, calendar, radar_saved)
     with gr.Tab("Run"):
         started = gr.Markdown()
         gr.Button("Run the agent now", variant="primary").click(run_now, None, started)

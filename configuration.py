@@ -102,6 +102,7 @@ class AgentConfig:
         "0 7 * * 1-5"  # weekdays 07:00 UTC, like the trending-models workflow
     )
     run_timeout_h: int = 6
+    radar_enabled: bool = False  # on hold: Radar's channel is not used yet
     radar_days_ahead: int = 2
     radar_days_back: int = 7  # released recently, support pending
     # Radar org name -> Hub accounts, where the names differ
