@@ -109,4 +109,5 @@ class AgentConfig:
     schedule: str = (
         "0 7 * * 1-5"  # weekdays 07:00 UTC, like the trending-models workflow
     )
+    schedule_text: str = "weekdays at 07:00 UTC"  # `schedule`, for people
     run_timeout_h: int = 6

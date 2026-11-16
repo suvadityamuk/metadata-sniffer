@@ -2,6 +2,7 @@
 Slack app for the metadata agent, over Socket Mode (no public URL needed).
 Only `AgentConfig.slack_operators` can use it.
 
+    /metadata-agent help               what each command does
     /metadata-agent sweep              sweep the trending models now
     /metadata-agent run <model-id>     check one model now
     /metadata-agent status [run-id]    recent runs, or one run's stats
@@ -143,12 +144,61 @@ def set_setting(args, user):
     return settings([], user)
 
 
-HELP = "\n".join(
-    line.strip()
-    for line in __doc__.splitlines()
-    if line.strip().startswith("/metadata-agent")
-)
+# (usage, what it does, example); shown by `/metadata-agent help`
+HELP = [
+    (
+        "sweep",
+        "Check the top trending models of every task now. Replies with a sweep ID.",
+        "sweep",
+    ),
+    (
+        "run <model-id>",
+        "Check one model now. Replies with a run ID.",
+        "run google/vit-base-patch16-224",
+    ),
+    (
+        "status [run-id]",
+        "Recent sweeps and runs, or one run's stats: models, snippet results, proposals, cost.",
+        "status sweep-20261117-0700-a1b2",
+    ),
+    (
+        "pending",
+        "Proposed PRs waiting for approval, with Approve / Reject buttons.",
+        "pending",
+    ),
+    ("settings", "Current settings, including dry run.", "settings"),
+    (
+        "set <key> <value>",
+        "Change a setting: `auto on|off` (open PRs without approval), `per-task N`, "
+        "`cap USD` (cost cap per run), `tasks a,b|all`.",
+        "set per-task 3",
+    ),
+]
+
+
+def help_message(args, user):
+    lines = [
+        f"*`/metadata-agent {usage}`*\n{what}  e.g. `/metadata-agent {example}`"
+        for usage, what, example in HELP
+    ]
+    config = AgentConfig()
+    intro = (
+        "*Metadata agent*: checks the *Use this model* snippets and README metadata of trending Hub models, "
+        f"and proposes fixes as PRs. Sweeps also run on their own, {config.schedule_text}."
+    )
+    if config.dry_run:
+        intro += f"\n_Dry run: PRs can only be opened on repos under {', '.join(config.dry_run_namespaces)}._"
+    return {
+        "text": "Metadata agent commands",
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+            for text in [intro, *lines]
+        ],
+    }
+
+
 COMMANDS = {
+    "help": help_message,
     "sweep": sweep,
     "run": run,
     "status": status,
@@ -166,7 +216,17 @@ def handle_command(ack, command, respond):
         return
     action, *args = command.get("text", "").split() or ["help"]
     if action not in COMMANDS:
-        respond(f"```{HELP}```")
+        unknown = {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"Unknown command `{action}`. Here is what I can do:",
+            },
+        }
+        respond(
+            text=f"Unknown command {action}",
+            blocks=[unknown, *help_message([], None)["blocks"]],
+        )
         return
     try:
         respond(**COMMANDS[action](args, command["user_id"]))

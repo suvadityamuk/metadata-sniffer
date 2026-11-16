@@ -1,23 +1,38 @@
 {
-  "_metadata": { "major_version": 1, "minor_version": 1 },
+  "_metadata": {
+    "major_version": 1,
+    "minor_version": 1
+  },
   "display_information": {
     "name": "model-metadata-assistant",
-    "description": "Checks Hub model snippets and metadata; /metadata-agent for sweeps, single-model runs and approvals."
+    "description": "Checks Hub model snippets and metadata. Type /metadata-agent help."
   },
   "features": {
-    "bot_user": { "display_name": "model-metadata-assistant", "always_online": true },
+    "bot_user": {
+      "display_name": "model-metadata-assistant",
+      "always_online": true
+    },
     "slash_commands": [
       {
         "command": "/metadata-agent",
-        "description": "sweep · run <model-id> · status [run-id] · pending · settings · set <key> <value>",
-        "usage_hint": "sweep | run <model-id> | status [run-id] | pending | settings | set <key> <value>",
+        "description": "Check and fix Hub model metadata. Start with: help",
+        "usage_hint": "help | sweep | run <model-id> | status | pending | settings",
         "should_escape": false
       }
     ]
   },
-  "oauth_config": { "scopes": { "bot": ["commands", "chat:write"] } },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "commands",
+        "chat:write"
+      ]
+    }
+  },
   "settings": {
-    "interactivity": { "is_enabled": true },
+    "interactivity": {
+      "is_enabled": true
+    },
     "org_deploy_enabled": false,
     "socket_mode_enabled": true,
     "token_rotation_enabled": false
