@@ -17,7 +17,7 @@ from configuration import AgentConfig
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
-SHARED_MODULES = ["configuration.py", "orchestrator.py", "proposals.py", "state.py"]
+SHARED_MODULES = ["configuration.py", "orchestrator.py", "proposals.py", "snippet_runner.py", "state.py"]
 TARGETS = {
     # space id, sdk, folder uploaded to the Space root, extra files kept at their repo path, secrets
     "approval": (

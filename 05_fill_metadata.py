@@ -15,7 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, ModelCard
 
-from jobs import Budget
+from jobs import Budget, exception_line, unprepare_snippet
 from llm import ask_json
 from proposals import Proposal, load_vocabulary, submit
 from state import load_agent_config
@@ -26,6 +26,7 @@ logger = setup_logging(__name__)
 
 SNIPPETS_PATH = "execution/snippets.json"
 METADATA_DONE_PATH = Path("execution/metadata_done.json")
+RESULTS_PATH = Path("execution/results.json")
 FIELDS = (
     "base_model",
     "datasets",
@@ -203,13 +204,36 @@ def propose(model_id, huggingface_api, vocabulary, budget, config) -> Proposal |
     )
 
 
+def snippet_evidence(model_id: str, collected: dict, result: dict) -> dict:
+    """This run's snippet checks for the model, shown next to the proposal in the approval Space."""
+    checks = [
+        {
+            "label": f"snippet {r['index']}",
+            "job_id": result["job_id"],
+            "model_id": model_id,
+            "passed": r["exit_code"] == 0,
+            "detail": "exit code 0, output checked"
+            if r["exit_code"] == 0
+            else exception_line(r["error"]),
+        }
+        for r in sorted(result.get("results", []), key=lambda r: r["index"])
+    ]
+    return {
+        "snippets": [unprepare_snippet(code) for code in collected.get("snippets", [])],
+        "checks": checks,
+        "snippet_status": result.get("status") or collected.get("skip_reason"),
+    }
+
+
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
     agent_config = load_agent_config(huggingface_api)
     budget = Budget.for_run(agent_config.max_cost_per_run_usd)
     vocabulary = load_vocabulary()
 
-    model_ids = [m["id"] for m in json.load(open(SNIPPETS_PATH))]
+    collected = {m["id"]: m for m in json.load(open(SNIPPETS_PATH))}
+    model_ids = list(collected)
+    results = json.loads(RESULTS_PATH.read_text()) if RESULTS_PATH.exists() else {}
     new_proposals, done = [], []
     for model_id in model_ids:
         if budget.reserved_usd + agent_config.llm_max_call_usd > budget.cap_usd:
@@ -228,6 +252,9 @@ if __name__ == "__main__":
         if proposal is None:
             continue
         logger.info(f"{model_id}: proposing {list(proposal.metadata)}")
+        proposal.evidence = snippet_evidence(
+            model_id, collected[model_id], results.get(model_id, {})
+        )
         new_proposals.append(proposal)
     submit(huggingface_api, new_proposals, agent_config.auto_open_prs)
     METADATA_DONE_PATH.write_text(json.dumps(done))

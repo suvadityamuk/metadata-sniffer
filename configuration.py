@@ -103,7 +103,7 @@ class AgentConfig:
     state_repo: str = (
         "suvadityamuk/metadata-agent-state"  # private dataset, see state.py
     )
-    approval_space: str = "suvadityamuk/metadata-agent"
+    approval_space: str = "model-metadata/metadata-agent"  # private; the org has only the two operators
     code_repo: str = "https://github.com/suvadityamuk/metadata-sniffer"
     code_revision: str = "feat/slack-app"  # back to "main" once the fork PRs are merged
     schedule: str = (

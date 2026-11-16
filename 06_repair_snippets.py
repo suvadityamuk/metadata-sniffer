@@ -128,6 +128,11 @@ def repair(
                     **candidates[key],
                     "job_id": entry["job_id"],
                     "original_error": exception_line(failures[key]["error"]),
+                    "original_job_id": failures[key]["job_id"],
+                    "fix_log_id": run_id,  # the fix ran as `<model>#<index>` in its job
+                    "original_snippet": unprepare_snippet(
+                        failed_models[model_id]["snippets"][int(index)]
+                    ),
                 }
             else:
                 result = (entry.get("results") or [{}])[0]
@@ -165,6 +170,26 @@ def to_proposal(model_id, fix, vocabulary) -> Proposal | None:
         f"With {with_metadata}, the snippet below runs successfully on [HF Jobs]({job_url}):\n\n"
         f"```python\n{unprepare_snippet(fix['fixed_snippet'])}\n```\n\n"
         f"This PR changes {changes}. Opened by the Hugging Face metadata agent, feedback welcome!",
+        evidence={
+            "snippet_before": fix["original_snippet"],
+            "snippet_after": unprepare_snippet(fix["fixed_snippet"]),
+            "checks": [
+                {
+                    "label": "current snippet",
+                    "job_id": fix["original_job_id"],
+                    "model_id": model_id,
+                    "passed": False,
+                    "detail": fix["original_error"],
+                },
+                {
+                    "label": "fixed snippet",
+                    "job_id": fix["job_id"],
+                    "model_id": fix["fix_log_id"],
+                    "passed": True,
+                    "detail": "exit code 0, output checked",
+                },
+            ],
+        },
     )
 
 
@@ -179,7 +204,7 @@ if __name__ == "__main__":
     collected = {m["id"]: m for m in json.loads(SNIPPETS_PATH.read_text())}
     report = json.loads(RESULTS_PATH.read_text())
     failures = {
-        (model_id, r["index"]): r
+        (model_id, r["index"]): {**r, "job_id": entry["job_id"]}
         for model_id, entry in report.items()
         if entry["status"] == "failed"
         for r in entry["results"]

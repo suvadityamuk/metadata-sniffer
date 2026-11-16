@@ -28,6 +28,8 @@ class Proposal:
     )
     pr_num: int | None = None  # set for "pr_update"
     reply: str | None = None  # comment posted with a "pr_update"
+    # what backs the proposal, shown in the approval Space: snippet check/fix jobs and snippets
+    evidence: dict | None = None
 
 
 def load_vocabulary() -> dict[str, set[str]]:

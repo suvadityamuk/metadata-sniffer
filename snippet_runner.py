@@ -16,6 +16,10 @@ RESULT_MARKER = "SNIPPET_RESULT "
 # prebuilt CPU wheels, so llama-cpp-python does not have to be compiled in the job
 EXTRA_INDEX_URL = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
 OUTPUT_MARKER = "SNIPPET_OUTPUT "
+# each snippet's own stdout/stderr is printed between these, so its log can be shown per model
+LOG_BEGIN = "SNIPPET_LOG_BEGIN "
+LOG_END = "SNIPPET_LOG_END"
+MAX_LOG_CHARS = 8000
 
 # Appended to each snippet: summarises `_result` (the snippet's trailing expression).
 DESCRIBE_RESULT = f"""
@@ -41,7 +45,14 @@ print({OUTPUT_MARKER!r} + __import__("json").dumps(_describe(globals().get("_res
 """
 
 
-def run_snippet(code: str, timeout_s: int) -> dict:
+def _text(stream) -> str:
+    return (
+        stream.decode(errors="replace") if isinstance(stream, bytes) else stream or ""
+    )
+
+
+def run_snippet(code: str, timeout_s: int) -> tuple[dict, str]:
+    """Returns the snippet's result and its log (stdout + stderr)."""
     start = time.time()
     try:
         proc = subprocess.run(
@@ -50,18 +61,25 @@ def run_snippet(code: str, timeout_s: int) -> dict:
             text=True,
             timeout=timeout_s,
         )
-    except subprocess.TimeoutExpired:
-        return {"exit_code": None, "error": f"timeout after {timeout_s}s"}
+    except subprocess.TimeoutExpired as e:
+        log = _text(e.stdout) + _text(e.stderr)
+        return {"exit_code": None, "error": f"timeout after {timeout_s}s"}, log
     output = None
     for line in proc.stdout.splitlines():
         if line.startswith(OUTPUT_MARKER):
             output = json.loads(line[len(OUTPUT_MARKER) :])
-    return {
+    log = "".join(
+        line + "\n"
+        for line in proc.stdout.splitlines()
+        if not line.startswith(OUTPUT_MARKER)
+    )
+    result = {
         "exit_code": proc.returncode,
         "output": output,
         "error": proc.stderr[-3000:] if proc.returncode else None,
         "seconds": round(time.time() - start),
     }
+    return result, log + proc.stderr
 
 
 if __name__ == "__main__":
@@ -82,8 +100,15 @@ if __name__ == "__main__":
                 check=False,
             )
         for index, code in enumerate(model["snippets"]):
-            result = {"id": model["id"], "index": index}
-            result.update(run_snippet(code, model["timeout_s"]))
-            print(RESULT_MARKER + json.dumps(result), flush=True)
+            result, log = run_snippet(code, model["timeout_s"])
+            print(
+                f"{LOG_BEGIN}{model['id']} {index}\n{log[-MAX_LOG_CHARS:]}\n{LOG_END}",
+                flush=True,
+            )
+            print(
+                RESULT_MARKER
+                + json.dumps({"id": model["id"], "index": index, **result}),
+                flush=True,
+            )
         # keep disk usage bounded: models in a batch are downloaded one at a time
         shutil.rmtree(os.environ.get("HF_HOME", "/tmp/hf"), ignore_errors=True)
