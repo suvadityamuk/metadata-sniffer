@@ -72,14 +72,28 @@ def run_now(profile: gr.OAuthProfile | None):
     return f"Started sweep `{run_id}` ([job]({job_url}))"
 
 
-config = load_agent_config(huggingface_api)
+def refresh():
+    """Reads the current proposals and settings; runs on every page load and on Refresh."""
+    config = load_agent_config(huggingface_api)
+    return (
+        gr.update(choices=pending_choices(), value=None),
+        "",
+        config.auto_open_prs,
+        config.num_trending_models_per_task,
+        config.max_cost_per_run_usd,
+        ", ".join(config.tasks or []),
+    )
+
+
 with gr.Blocks(title="Metadata agent") as demo:
     gr.Markdown(
         "# Metadata agent\nProposed PRs wait here for approval when auto mode is off."
     )
     gr.LoginButton()
     with gr.Tab("Proposals"):
-        choice = gr.Dropdown(pending_choices(), label="Pending proposals")
+        with gr.Row():
+            choice = gr.Dropdown([], label="Pending proposals", scale=5)
+            refresh_button = gr.Button("↻ Refresh", scale=1)
         details = gr.Markdown()
         with gr.Row():
             approve, reject = (
@@ -91,20 +105,19 @@ with gr.Blocks(title="Metadata agent") as demo:
         approve.click(approve_proposal, choice, [choice, outcome])
         reject.click(reject_proposal, choice, [choice, outcome])
     with gr.Tab("Settings"):
-        auto_open = gr.Checkbox(config.auto_open_prs, label="Open PRs without approval")
-        per_task = gr.Number(
-            config.num_trending_models_per_task,
-            label="Trending models per task",
-            precision=0,
-        )
-        cap = gr.Number(config.max_cost_per_run_usd, label="Cost cap per run (USD)")
-        tasks = gr.Textbox(
-            ", ".join(config.tasks or []), label="Tasks (comma separated, empty: all)"
-        )
+        auto_open = gr.Checkbox(label="Open PRs without approval")
+        per_task = gr.Number(label="Trending models per task", precision=0)
+        cap = gr.Number(label="Cost cap per run (USD)")
+        tasks = gr.Textbox(label="Tasks (comma separated, empty: all)")
         saved = gr.Markdown()
         gr.Button("Save").click(save_settings, [auto_open, per_task, cap, tasks], saved)
     with gr.Tab("Run"):
         started = gr.Markdown()
         gr.Button("Run the agent now", variant="primary").click(run_now, None, started)
+
+    # proposals and settings change outside this page (scheduled sweeps, Slack), so never show stale ones
+    current = [choice, details, auto_open, per_task, cap, tasks]
+    demo.load(refresh, None, current)
+    refresh_button.click(refresh, None, current)
 
 demo.launch()

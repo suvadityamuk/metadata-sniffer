@@ -140,7 +140,10 @@ def verify(field, value, readme, huggingface_api, vocabulary):
 def propose(model_id, huggingface_api, vocabulary, budget, config) -> Proposal | None:
     card = ModelCard.load(model_id, token=huggingface_api.token)
     existing = card.data.to_dict()
-    missing = [f for f in FIELDS if not existing.get(f)]
+    # the Hub infers these from the repo when the card omits them, and the snippet uses the inferred value
+    info = huggingface_api.model_info(model_id)
+    inferred = {"pipeline_tag": info.pipeline_tag, "library_name": info.library_name}
+    missing = [f for f in FIELDS if not existing.get(f) and not inferred.get(f)]
     if not missing:
         return None
     answer = ask_json(
