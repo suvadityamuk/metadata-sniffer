@@ -102,7 +102,7 @@ def open_pr(huggingface_api: HfApi, proposal: Proposal) -> str:
             f"https://huggingface.co/{proposal.model_id}/discussions/{proposal.pr_num}"
         )
 
-    url = metadata_update(
+    commit = metadata_update(
         proposal.model_id,
         proposal.metadata,
         overwrite=proposal.overwrite,
@@ -111,11 +111,17 @@ def open_pr(huggingface_api: HfApi, proposal: Proposal) -> str:
         commit_description=proposal.description,
         token=huggingface_api.token,
     )
+    track_pr(huggingface_api, proposal, commit.pr_num, commit.pr_url)
+    return commit.pr_url
+
+
+def track_pr(huggingface_api: HfApi, proposal: Proposal, num: int, url: str):
+    """Records an opened PR for `07_track_prs.py`."""
     prs = read(huggingface_api, "prs.json", [])
     prs.append(
         {
             "model_id": proposal.model_id,
-            "num": int(url.rstrip("/").split("/")[-1]),
+            "num": num,
             "url": url,
             "kind": proposal.kind,
             "title": proposal.title,
@@ -125,7 +131,6 @@ def open_pr(huggingface_api: HfApi, proposal: Proposal) -> str:
         }
     )
     write(huggingface_api, "prs.json", prs, f"Track {url}")
-    return url
 
 
 def submit(huggingface_api: HfApi, new: list[Proposal], auto_open: bool):
