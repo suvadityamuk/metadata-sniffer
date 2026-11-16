@@ -94,7 +94,9 @@ class AgentConfig:
     dry_run: bool = True
     dry_run_namespaces: List[str] = field(default_factory=lambda: ["suvadityamuk"])
     # Slack member IDs allowed to use /metadata-agent
-    slack_operators: List[str] = field(default_factory=lambda: ["U0A2P5BE22U"])
+    slack_operators: List[str] = field(
+        default_factory=lambda: ["U0A2P5BE22U", "U07NVV3R681"]
+    )
     slack_space: str = "suvadityamuk/metadata-agent-slack"
     # operators (HF usernames) who can approve PRs, change settings and start runs in the Space
     operators: List[str] = field(default_factory=lambda: ["suvadityamuk", "ariG23498"])
