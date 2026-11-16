@@ -207,6 +207,9 @@ if __name__ == "__main__":
         level=logging.INFO
     )  # shows the Socket Mode connection in the Space logs
     threading.Thread(
-        target=HTTPServer(("0.0.0.0", 7860), Health).serve_forever, daemon=True
+        target=HTTPServer(
+            ("0.0.0.0", int(os.environ.get("PORT", 7860))), Health
+        ).serve_forever,
+        daemon=True,
     ).start()
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
