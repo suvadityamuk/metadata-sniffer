@@ -44,7 +44,8 @@ SETTINGS = {
 def sweep(args, user):
     run_id, job_url = launch(huggingface_api, load_agent_config(huggingface_api))
     return {
-        "text": f"Sweep `{run_id}` started (<{job_url}|job>). The report will be posted when it finishes."
+        "response_type": "in_channel",  # sweeps and runs are announced to the channel
+        "text": f"<@{user}> started sweep `{run_id}` (<{job_url}|job>). The report will be posted when it finishes.",
     }
 
 
@@ -57,7 +58,10 @@ def run(args, user):
     run_id, job_url = launch(
         huggingface_api, load_agent_config(huggingface_api), model_id
     )
-    return {"text": f"Run `{run_id}` for `{model_id}` started (<{job_url}|job>)."}
+    return {
+        "response_type": "in_channel",
+        "text": f"<@{user}> started run `{run_id}` for `{model_id}` (<{job_url}|job>).",
+    }
 
 
 def status(args, user):
@@ -212,7 +216,10 @@ COMMANDS = {
 def handle_command(ack, command, respond):
     ack()
     if command["user_id"] not in AgentConfig().slack_operators:
-        respond("Only the metadata agent's operators can use this command.")
+        respond(
+            text="Only the metadata agent's operators can use this command.",
+            response_type="ephemeral",
+        )
         return
     action, *args = command.get("text", "").split() or ["help"]
     if action not in COMMANDS:
@@ -226,12 +233,19 @@ def handle_command(ack, command, respond):
         respond(
             text=f"Unknown command {action}",
             blocks=[unknown, *help_message([], None)["blocks"]],
+            response_type="ephemeral",
         )
         return
     try:
-        respond(**COMMANDS[action](args, command["user_id"]))
+        # only the person who typed the command sees the reply, unless a sweep/run announces itself
+        respond(
+            **{
+                "response_type": "ephemeral",
+                **COMMANDS[action](args, command["user_id"]),
+            }
+        )
     except Exception as e:  # tell the operator instead of failing silently
-        respond(f"`{action}` failed: {e}")
+        respond(text=f"`{action}` failed: {e}", response_type="ephemeral")
 
 
 def _decide(ack, body, respond, approve: bool):
@@ -242,7 +256,7 @@ def _decide(ack, body, respond, approve: bool):
     message = decide(
         huggingface_api, int(body["actions"][0]["value"]), approve, f"slack:{user}"
     )
-    respond(text=message, replace_original=False)
+    respond(text=message, replace_original=False, response_type="ephemeral")
 
 
 app.action("approve_proposal")(
