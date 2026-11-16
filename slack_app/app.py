@@ -11,6 +11,7 @@ Only `AgentConfig.slack_operators` can use it.
 """
 
 import json
+import logging
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -202,6 +203,9 @@ class Health(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO
+    )  # shows the Socket Mode connection in the Space logs
     threading.Thread(
         target=HTTPServer(("0.0.0.0", 7860), Health).serve_forever, daemon=True
     ).start()
