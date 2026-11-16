@@ -10,9 +10,9 @@ import gradio as gr
 from huggingface_hub import HfApi
 
 from configuration import AgentConfig
-from orchestrator import launch_run
-from proposals import Proposal, open_pr
-from state import load_agent_config, read, write
+from orchestrator import launch
+from proposals import decide
+from state import load_agent_config, read, update_settings
 
 huggingface_api = HfApi()  # HF_TOKEN Space secret
 
@@ -38,59 +38,38 @@ def show(choice):
     return f"### [{p['model_id']}](https://huggingface.co/{p['model_id']})\n**{p['title']}**\n\n```yaml\n{json.dumps(p['metadata'], indent=2)}\n```\n\n{p['description']}"
 
 
-def decide(choice, approve, profile: gr.OAuthProfile | None):
+def _decide(choice, approve, profile):
     _check(profile)
-    proposals = read(huggingface_api, "proposals.json", [])
-    index = int(choice.split(":")[0])
-    proposal = proposals[index]
-    if proposal["status"] != "pending":
-        raise gr.Error("Already decided.")
-    if approve:
-        fields = {
-            k: v for k, v in proposal.items() if k in Proposal.__dataclass_fields__
-        }
-        proposal["url"] = open_pr(huggingface_api, Proposal(**fields))
-    proposal["status"] = "opened" if approve else "rejected"
-    proposal["decided_by"] = profile.username
-    write(
-        huggingface_api,
-        "proposals.json",
-        proposals,
-        f"{proposal['status']} by {profile.username}",
+    message = decide(
+        huggingface_api, int(choice.split(":")[0]), approve, profile.username
     )
-    message = f"Opened {proposal['url']}" if approve else "Rejected"
     return gr.update(choices=pending_choices(), value=None), message
 
 
 def approve_proposal(choice, profile: gr.OAuthProfile | None):
-    return decide(choice, True, profile)
+    return _decide(choice, True, profile)
 
 
 def reject_proposal(choice, profile: gr.OAuthProfile | None):
-    return decide(choice, False, profile)
+    return _decide(choice, False, profile)
 
 
 def save_settings(auto_open, per_task, cap, tasks, profile: gr.OAuthProfile | None):
     _check(profile)
-    settings = {
+    changes = {
         "auto_open_prs": auto_open,
         "num_trending_models_per_task": int(per_task),
         "max_cost_per_run_usd": float(cap),
         "tasks": [t.strip() for t in tasks.split(",") if t.strip()] or None,
     }
-    write(
-        huggingface_api,
-        "settings.json",
-        settings,
-        f"Settings changed by {profile.username}",
-    )
+    update_settings(huggingface_api, changes, profile.username)
     return "Saved"
 
 
 def run_now(profile: gr.OAuthProfile | None):
     _check(profile)
-    job = launch_run(huggingface_api, load_agent_config(huggingface_api))
-    return f"Started [{job.id}]({job.url})"
+    run_id, job_url = launch(huggingface_api, load_agent_config(huggingface_api))
+    return f"Started sweep `{run_id}` ([job]({job_url}))"
 
 
 config = load_agent_config(huggingface_api)

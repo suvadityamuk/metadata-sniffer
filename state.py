@@ -53,3 +53,16 @@ def load_agent_config(huggingface_api: HfApi) -> AgentConfig:
     return AgentConfig(
         **{k: v for k, v in settings.items() if k in EDITABLE_SETTINGS and k in known}
     )
+
+
+def update_settings(
+    huggingface_api: HfApi, changes: dict, changed_by: str
+) -> AgentConfig:
+    """Applies validated setting changes on top of the stored ones; unknown keys are refused."""
+    if unknown := set(changes) - set(EDITABLE_SETTINGS):
+        raise ValueError(f"not editable: {sorted(unknown)}")
+    settings = {**read(huggingface_api, "settings.json", {}), **changes}
+    write(
+        huggingface_api, "settings.json", settings, f"Settings changed by {changed_by}"
+    )
+    return load_agent_config(huggingface_api)

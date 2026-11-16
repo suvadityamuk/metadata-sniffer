@@ -16,7 +16,13 @@ from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
 from configuration import ExecuteCodeConfig
-from jobs import Budget, exception_line, prepare_snippet, run_snippets
+from jobs import (
+    Budget,
+    exception_line,
+    prepare_snippet,
+    run_snippets,
+    unprepare_snippet,
+)
 from llm import ask_json
 from proposals import Proposal, load_vocabulary, submit
 from state import load_agent_config
@@ -59,7 +65,7 @@ def diagnose(huggingface_api, model, failure, attempts, budget, config) -> dict 
         if info.transformers_info
         else None,
         "architectures": (info.config or {}).get("architectures"),
-        "original_snippet": model["snippets"][failure["index"]],
+        "original_snippet": unprepare_snippet(model["snippets"][failure["index"]]),
         "error": failure["error"],
         "previous_attempts": attempts,
     }
@@ -157,7 +163,7 @@ def to_proposal(model_id, fix, vocabulary) -> Proposal | None:
         title=f"Fix the 'Use this model' snippet: set {', '.join(metadata)}",
         description=f"The *Use this model* snippet of this model currently fails with:\n\n```\n{fix['original_error']}\n```\n\n"
         f"With {with_metadata}, the snippet below runs successfully on [HF Jobs]({job_url}):\n\n"
-        f"```python\n{fix['fixed_snippet']}\n```\n\n"
+        f"```python\n{unprepare_snippet(fix['fixed_snippet'])}\n```\n\n"
         f"This PR changes {changes}. Opened by the Hugging Face metadata agent, feedback welcome!",
     )
 

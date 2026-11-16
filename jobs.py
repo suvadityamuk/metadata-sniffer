@@ -154,6 +154,19 @@ def prepare_snippet(code: str) -> str:
     return ast.unparse(tree)
 
 
+def unprepare_snippet(code: str) -> str:
+    """Removes what `prepare_snippet` added, for showing snippets to the LLM and in PRs."""
+    lines = []
+    for line in code.splitlines():
+        if line.startswith("_result = "):
+            value = line[len("_result = ") :]
+            if value.isidentifier():
+                continue  # `_result = name` only re-exposed an assignment
+            line = value
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def snippet_timeout_s(weights_gb: float, config: ExecuteCodeConfig) -> int:
     """Covers download + load + one forward/generate call."""
     return int(

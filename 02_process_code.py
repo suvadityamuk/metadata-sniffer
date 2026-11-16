@@ -1,5 +1,5 @@
 """
-Selects the top N trending models per task and collects their "Use this model"
+Selects the top N trending models per task (or the single `MODEL_ID`) and collects their "Use this model"
 snippets for the libraries we can run (only when the model is tagged with that
 library), then estimates the hardware each model needs. Models without a
 runnable snippet are still listed, for the metadata checks.
@@ -18,7 +18,6 @@ import requests
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
-import radar
 from configuration import AgentConfig
 from jobs import prepare_snippet
 from state import load_agent_config, read
@@ -203,42 +202,31 @@ if __name__ == "__main__":
     checked = read(huggingface_api, "checked.json", {})
 
     results = []
-    for task in list_tasks(agent_config):
-        for model_id, tags, sha in select_models(
-            huggingface_api,
-            task,
-            agent_config.num_trending_models_per_task,
-            checked,
-            agent_config.recheck_after_days,
-        ):
-            results.append(asdict(collect(huggingface_api, model_id, task, tags, sha)))
-            logger.info(f"Collected {model_id} ({task})")
-
-    # new repos of releases on Radar's calendar
-    calendar = (
-        read(huggingface_api, "radar.json", {}).get("calendar", "")
-        if agent_config.radar_enabled
-        else ""
-    )
-    releases = radar.releases_to_watch(radar.parse_calendar(calendar), agent_config)
-    seen = {r["id"] for r in results}
-    for model_id in radar.new_models(huggingface_api, releases, agent_config):
+    if model_id := os.environ.get("MODEL_ID"):  # `/metadata-agent run <model-id>`
         info = huggingface_api.model_info(model_id)
-        if (
-            model_id in seen
-            or info.gated
-            or recently_checked(
-                checked, model_id, info.sha, agent_config.recheck_after_days
-            )
-            or not has_discussions(huggingface_api, model_id)
-        ):
-            continue
-        results.append(
-            asdict(
-                collect(huggingface_api, model_id, "radar", info.tags or [], info.sha)
-            )
+        result = collect(
+            huggingface_api,
+            model_id,
+            info.pipeline_tag or "unknown",
+            info.tags or [],
+            info.sha,
         )
-        logger.info(f"Collected {model_id} (radar)")
+        if info.gated or not has_discussions(huggingface_api, model_id):
+            result.skip_reason = "gated or no discussion tab"
+        results.append(asdict(result))
+    else:
+        for task in list_tasks(agent_config):
+            for model_id, tags, sha in select_models(
+                huggingface_api,
+                task,
+                agent_config.num_trending_models_per_task,
+                checked,
+                agent_config.recheck_after_days,
+            ):
+                results.append(
+                    asdict(collect(huggingface_api, model_id, task, tags, sha))
+                )
+                logger.info(f"Collected {model_id} ({task})")
 
     SNIPPETS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SNIPPETS_PATH.write_text(json.dumps(results, indent=2))

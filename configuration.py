@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -90,6 +90,14 @@ class AgentConfig:
     llm_max_tokens: int = 24000  # Kimi reasons at length on long READMEs
     llm_max_call_usd: float = 0.20  # reserved per call, settled with the reported cost
     llm_max_readme_chars: int = 60000
+    # dry run: PRs may only be opened on repos in these namespaces, whatever the other settings say
+    dry_run: bool = True
+    dry_run_namespaces: List[str] = field(default_factory=lambda: ["suvadityamuk"])
+    # Slack member IDs allowed to use /metadata-agent
+    slack_operators: List[str] = field(
+        default_factory=lambda: ["U0A2P5BE22U", "U07NVV3R681"]
+    )
+    slack_space: str = "suvadityamuk/metadata-agent-slack"
     # operators (HF usernames) who can approve PRs, change settings and start runs in the Space
     operators: List[str] = field(default_factory=lambda: ["suvadityamuk", "ariG23498"])
     state_repo: str = (
@@ -97,24 +105,9 @@ class AgentConfig:
     )
     approval_space: str = "suvadityamuk/metadata-agent"
     code_repo: str = "https://github.com/suvadityamuk/metadata-sniffer"
-    code_revision: str = "main"
+    code_revision: str = "feat/slack-app"  # back to "main" once the fork PRs are merged
     schedule: str = (
         "0 7 * * 1-5"  # weekdays 07:00 UTC, like the trending-models workflow
     )
+    schedule_text: str = "weekdays at 07:00 UTC"  # `schedule`, for people
     run_timeout_h: int = 6
-    radar_enabled: bool = False  # on hold: Radar's channel is not used yet
-    radar_days_ahead: int = 2
-    radar_days_back: int = 7  # released recently, support pending
-    # Radar org name -> Hub accounts, where the names differ
-    radar_org_authors: Dict[str, List[str]] = field(
-        default_factory=lambda: {
-            "Zhipu": ["zai-org"],
-            "Kimi": ["moonshotai"],
-            "Ant Group": ["inclusionAI"],
-            "Meta": ["facebook", "meta-llama"],
-            "Shanghai AI Lab": ["internlm", "OpenGVLab"],
-            "Meituan": ["meituan-longcat"],
-            "IBM": ["ibm-granite"],
-            "SparkLLM": ["iflytek"],
-        }
-    )
