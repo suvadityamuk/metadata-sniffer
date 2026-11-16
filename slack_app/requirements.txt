@@ -1,0 +1,4 @@
+slack-bolt==1.30.0
+huggingface-hub==1.0.1
+python-dotenv==1.2.1
+requests==2.32.5

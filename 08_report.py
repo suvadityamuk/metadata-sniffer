@@ -6,6 +6,7 @@ any huggingface.js snippet template fixes. Then records the fully checked models
 
 import json
 import os
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -123,15 +124,35 @@ def mark_checked(
     write(huggingface_api, "checked.json", checked, "Record checked models")
 
 
+def record_run(
+    huggingface_api: HfApi, run_id: str, results: dict, proposals: list[dict]
+):
+    """Stats of this run in `runs/<run_id>.json`, for `/metadata-agent status <run-id>`."""
+    record = read(huggingface_api, f"runs/{run_id}.json", {"id": run_id})
+    budget = _load(Path("execution/budget.json"), {})
+    record.update(
+        status="finished",
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        models=len(results),
+        snippets=dict(Counter(entry["status"] for entry in results.values())),
+        proposals=[
+            {"model_id": p["model_id"], "kind": p["kind"], "status": p["status"]}
+            for p in proposals
+            if p.get("run_id") == run_id
+        ],
+        reserved_usd=round(budget.get("reserved_usd", 0.0), 2),
+    )
+    write(huggingface_api, f"runs/{run_id}.json", record, f"Finish {run_id}")
+
+
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
     space_url = f"https://huggingface.co/spaces/{AgentConfig.approval_space}"
     results = _load(RESULTS_PATH, {})
+    run_id = os.environ.get("RUN_ID", "manual")
+    proposals = read(huggingface_api, "proposals.json", [])
     rows = build_rows(
-        results,
-        read(huggingface_api, "proposals.json", []),
-        read(huggingface_api, "prs.json", []),
-        space_url,
+        results, proposals, read(huggingface_api, "prs.json", []), space_url
     )
     alerts = _load(TEMPLATE_ALERTS_PATH, [])
 
@@ -144,7 +165,8 @@ if __name__ == "__main__":
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     messages = [
         SlackMessage(
-            text=f"Metadata agent report {today}", msg_type=SlackMessageType.HEADER
+            text=f"Metadata agent report {today} · {run_id}",
+            msg_type=SlackMessageType.HEADER,
         ),
         SlackMessage(msg_type=SlackMessageType.TABLE, text=tables[0]),
     ]
@@ -166,3 +188,4 @@ if __name__ == "__main__":
         _load(SNIPPETS_PATH, []),
         _load(METADATA_DONE_PATH, []),
     )
+    record_run(huggingface_api, run_id, results, proposals)
