@@ -4,6 +4,7 @@ flavor selection from the live hardware catalogue, a per-run cost budget, and
 batched, secret-free snippet execution with results parsed from the job logs.
 """
 
+import ast
 import base64
 import json
 import re
@@ -25,6 +26,7 @@ FP8_GPUS = ("L4", "L40S", "H100", "H200", "B200")  # compute capability >= 8.9
 RUNNER_SOURCE = Path(__file__).with_name("snippet_runner.py").read_text()
 TERMINAL_STAGES = ("COMPLETED", "ERROR", "CANCELED", "DELETED")
 EXCEPTION_LINE = re.compile(r"^[\w.]+(Error|Exception|Interrupt)\b")
+BUDGET_PATH = Path("execution/budget.json")
 
 
 @dataclass
@@ -38,14 +40,30 @@ class Flavor:
 
 @dataclass
 class Budget:
+    """Per-run spend cap, persisted so every stage of a run draws from the same cap."""
+
     cap_usd: float
     reserved_usd: float = 0.0
+
+    @classmethod
+    def for_run(cls, cap_usd: float) -> "Budget":
+        reserved = (
+            json.loads(BUDGET_PATH.read_text())["reserved_usd"]
+            if BUDGET_PATH.exists()
+            else 0.0
+        )
+        return cls(cap_usd=cap_usd, reserved_usd=reserved)
 
     def reserve(self, usd: float) -> bool:
         if self.reserved_usd + usd > self.cap_usd:
             return False
-        self.reserved_usd += usd
+        self.charge(usd)
         return True
+
+    def charge(self, usd: float):
+        self.reserved_usd += usd
+        BUDGET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        BUDGET_PATH.write_text(json.dumps({"reserved_usd": self.reserved_usd}))
 
 
 def _gb(text: str) -> float:
@@ -97,6 +115,35 @@ def pick_flavor(
         if flavor.memory_gb >= memory_needed and flavor.storage_gb >= disk_needed:
             return flavor
     return None
+
+
+def prepare_snippet(code: str) -> str:
+    """Drops install lines and binds the snippet's final value to `_result` so the runner can inspect it."""
+    lines = [
+        line
+        for line in code.splitlines()
+        if not line.lstrip().startswith(("!", "# pip", "%pip"))
+    ]
+    tree = ast.parse("\n".join(lines))
+    if tree.body and isinstance(tree.body[-1], ast.Expr):
+        value = tree.body[-1].value
+        if (
+            isinstance(value, ast.Call)
+            and getattr(value.func, "id", None) == "print"
+            and value.args
+        ):
+            value = value.args[0]  # `print(x)` -> inspect x
+        tree.body[-1] = ast.Assign(
+            targets=[ast.Name(id="_result", ctx=ast.Store())], value=value
+        )
+        ast.fix_missing_locations(tree)
+    elif (
+        tree.body
+        and isinstance(tree.body[-1], ast.Assign)
+        and isinstance(tree.body[-1].targets[0], ast.Name)
+    ):
+        return f"{ast.unparse(tree)}\n_result = {tree.body[-1].targets[0].id}"
+    return ast.unparse(tree)
 
 
 def snippet_timeout_s(weights_gb: float, config: ExecuteCodeConfig) -> int:

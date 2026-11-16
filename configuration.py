@@ -81,3 +81,7 @@ class AgentConfig:
     max_snippet_runs: int = 3  # original run + 2 repair attempts
     max_cost_per_run_usd: float = 10.0
     tasks: Optional[List[str]] = None  # None: every Hub task
+    llm_model: str = "moonshotai/Kimi-K3.1-Pro"
+    llm_max_tokens: int = 24000  # Kimi reasons at length on long READMEs
+    llm_max_call_usd: float = 0.20  # reserved per call, settled with the reported cost
+    llm_max_readme_chars: int = 60000

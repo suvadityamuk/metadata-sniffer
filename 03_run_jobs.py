@@ -32,7 +32,7 @@ RESULTS_PATH = Path("execution/results.json")
 if __name__ == "__main__":
     huggingface_api = HfApi(token=os.environ["HF_TOKEN"])
     execute_config = ExecuteCodeConfig()
-    budget = Budget(cap_usd=AgentConfig().max_cost_per_run_usd)
+    budget = Budget.for_run(AgentConfig().max_cost_per_run_usd)
 
     collected = json.loads(SNIPPETS_PATH.read_text())
     report = {
