@@ -33,6 +33,7 @@ BUDGET_PATH = Path("execution/budget.json")
 class Flavor:
     name: str
     gpu: str | None
+    cpus: int
     memory_gb: float  # total VRAM for GPU flavors, RAM for CPU flavors
     storage_gb: float
     usd_per_minute: float
@@ -81,6 +82,7 @@ def load_flavors() -> list[Flavor]:
             Flavor(
                 name=hw["name"],
                 gpu=accelerator["model"] if accelerator else None,
+                cpus=int(hw["cpu"].split()[0]),
                 memory_gb=_gb(accelerator["vram"]) * int(accelerator["quantity"])
                 if accelerator
                 else _gb(hw["ram"]),
@@ -104,6 +106,12 @@ def pick_flavor(
     for flavor in flavors:
         if cpu_only and flavor.gpu is not None:
             continue
+        if (
+            cpu_only
+            and weights_gb > config.max_cpu_weights_gb
+            and flavor.cpus < config.min_cpus_large_cpu_models
+        ):
+            continue  # llama.cpp generation on 2 vCPUs is too slow for larger models
         if (
             flavor.gpu is None
             and not cpu_only
@@ -185,32 +193,55 @@ def launch_batch(
 
 
 def collect_results(
-    huggingface_api: HfApi, job_ids: list[str], config: ExecuteCodeConfig
-) -> dict[str, list[dict]]:
-    """Waits for all jobs and returns the per-snippet results, keyed by job id."""
-    pending, results = set(job_ids), {}
+    huggingface_api: HfApi, job_timeouts: dict[str, int], config: ExecuteCodeConfig
+) -> tuple[dict[str, list[dict]], dict[str, float]]:
+    """
+    Waits for all jobs and returns the per-snippet results and how long each job
+    took (an upper bound of its billed time), keyed by job id.
+    A job still unfinished after its timeout plus `max_queue_minutes` (e.g. stuck
+    waiting for hardware) is cancelled; its missing results count as inconclusive.
+    """
+    start = time.time()
+    pending, results, durations = set(job_timeouts), {}, {}
     while pending:
         for job_id in list(pending):
             job = huggingface_api.inspect_job(
                 job_id=job_id, namespace=config.jobs_namespace
             )
-            if job.status.stage not in TERMINAL_STAGES:
-                continue
-            pending.discard(job_id)
-            logs = huggingface_api.fetch_job_logs(
-                job_id=job_id, namespace=config.jobs_namespace
+            overdue = (
+                time.time() - start
+                > job_timeouts[job_id] + config.max_queue_minutes * 60
             )
+            if job.status.stage not in TERMINAL_STAGES and not overdue:
+                continue
+            if overdue and job.status.stage not in TERMINAL_STAGES:
+                huggingface_api.cancel_job(
+                    job_id=job_id, namespace=config.jobs_namespace
+                )
+                logger.warning(
+                    f"Job {job_id} cancelled: overdue ({job.status.message})"
+                )
+            pending.discard(job_id)
+            try:
+                logs = list(
+                    huggingface_api.fetch_job_logs(
+                        job_id=job_id, namespace=config.jobs_namespace
+                    )
+                )
+            except Exception:
+                logs = []  # the job never started
             results[job_id] = [
                 json.loads(line[len(RESULT_MARKER) :])
                 for line in logs
                 if line.startswith(RESULT_MARKER)
             ]
+            durations[job_id] = time.time() - start
             logger.info(
                 f"Job {job_id} {job.status.stage}: {len(results[job_id])} results"
             )
         if pending:
             time.sleep(30)
-    return results
+    return results, durations
 
 
 def output_problem(output: dict | None) -> str | None:
@@ -308,18 +339,20 @@ def run_snippets(
         mid: {"status": "skipped", "reason": reason} for mid, reason in skipped.items()
     }
 
-    job_models = {}
+    job_models, job_timeouts = {}, {}
     for flavor, batch_models, timeout_s in batches:
         job = launch_batch(huggingface_api, flavor, batch_models, timeout_s, config)
-        job_models[job.id] = (flavor, batch_models)
+        job_models[job.id], job_timeouts[job.id] = (flavor, batch_models), timeout_s
         logger.info(
             f"Launched {job.url} on {flavor.name} for {[m['id'] for m in batch_models]}"
         )
 
-    for job_id, results in collect_results(
-        huggingface_api, list(job_models), config
-    ).items():
+    results_by_job, durations = collect_results(huggingface_api, job_timeouts, config)
+    for job_id, results in results_by_job.items():
         flavor, batch_models = job_models[job_id]
+        # settle the worst-case reservation with the time the job actually took
+        billed_s = min(durations[job_id], job_timeouts[job_id])
+        budget.charge(flavor.usd_per_minute * (billed_s - job_timeouts[job_id]) / 60)
         for model in batch_models:
             model_results = [r for r in results if r["id"] == model["id"]]
             report[model["id"]] = {
