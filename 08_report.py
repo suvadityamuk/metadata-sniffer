@@ -23,6 +23,7 @@ RESULTS_PATH = Path("execution/results.json")
 SNIPPETS_PATH = Path("execution/snippets.json")
 METADATA_DONE_PATH = Path("execution/metadata_done.json")
 TEMPLATE_ALERTS_PATH = Path("execution/template_alerts.json")
+CACHED_PATH = Path("execution/cached.json")
 SNIPPET_STATUS = {
     "ok": "snippet works",
     "failed": "snippet broken",
@@ -65,7 +66,11 @@ def pr_status(pr: dict) -> str:
 
 
 def build_rows(
-    results: dict, proposals: list[dict], prs: list[dict], space_url: str
+    results: dict,
+    proposals: list[dict],
+    prs: list[dict],
+    space_url: str,
+    team_prs: list[dict] = (),
 ) -> list[list[dict]]:
     rows, week_ago = [], datetime.now(timezone.utc) - timedelta(days=7)
     for pr in prs:
@@ -92,6 +97,18 @@ def build_rows(
                     _text("awaiting approval 👀"),
                 ]
             )
+    for model in team_prs:
+        pr = model["team_pr"]
+        rows.append(
+            [
+                _link(model["id"], f"https://huggingface.co/{model['id']}"),
+                _text("team PR"),
+                _link(f"#{pr['num']}", pr["url"]),
+                _text(
+                    f"@{pr['author']} has an open PR, so the agent proposes nothing here"
+                ),
+            ]
+        )
     for model_id, entry in results.items():
         status = SNIPPET_STATUS.get(entry["status"], entry["status"])
         detail = entry.get("reason") or "; ".join(entry.get("problems", [])[:1])
@@ -151,9 +168,12 @@ if __name__ == "__main__":
     results = _load(RESULTS_PATH, {})
     run_id = os.environ.get("RUN_ID", "manual")
     proposals = read(huggingface_api, "proposals.json", [])
+    snippets = _load(SNIPPETS_PATH, [])
+    team_prs = [m for m in snippets if m.get("team_pr")]
     rows = build_rows(
-        results, proposals, read(huggingface_api, "prs.json", []), space_url
+        results, proposals, read(huggingface_api, "prs.json", []), space_url, team_prs
     )
+    cached = _load(CACHED_PATH, [])
     alerts = _load(TEMPLATE_ALERTS_PATH, [])
 
     # one message: header, table, huggingface.js alerts; only very long tables spill over
@@ -170,6 +190,9 @@ if __name__ == "__main__":
         ),
         SlackMessage(msg_type=SlackMessageType.TABLE, text=tables[0]),
     ]
+    if cached:
+        note = f"{len(cached)} models skipped: already checked at their current commit (cached)."
+        messages.insert(1, SlackMessage(text=note))
     if alerts:
         messages.append(
             SlackMessage(text="*Snippet template fixes needed in huggingface.js*")
@@ -185,7 +208,7 @@ if __name__ == "__main__":
     mark_checked(
         huggingface_api,
         results,
-        _load(SNIPPETS_PATH, []),
+        snippets,
         _load(METADATA_DONE_PATH, []),
     )
     record_run(huggingface_api, run_id, results, proposals)

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import requests
 from huggingface_hub import HfApi, metadata_update
 
-from configuration import AgentConfig, ModelCheckerConfig
+from configuration import AgentConfig
 from state import read, write
 
 
@@ -49,27 +49,22 @@ def load_vocabulary() -> dict[str, set[str]]:
 
 
 def covered_by_open_pr(huggingface_api: HfApi, proposal: Proposal) -> bool:
-    """An open PR by the team or the agent already changes one of the proposal's fields."""
-    team = {
-        *ModelCheckerConfig().avocado_team_members,
-        huggingface_api.whoami()["name"],
-    }
+    """Any open PR by the team, or an open PR by the agent that changes one of the proposal's fields."""
+    team, agent = AgentConfig().team_pr_authors, huggingface_api.whoami()["name"]
     for discussion in huggingface_api.get_repo_discussions(proposal.model_id):
-        if not (
-            discussion.is_pull_request
-            and discussion.status == "open"
-            and discussion.author in team
-        ):
+        if not (discussion.is_pull_request and discussion.status == "open"):
             continue
-        diff = (
-            huggingface_api.get_discussion_details(
-                proposal.model_id, discussion.num
-            ).diff
-            or ""
-        )
-        changed = "\n".join(line for line in diff.splitlines() if line[:1] in "+-")
-        if any(f"{field}:" in changed for field in proposal.metadata):
+        if discussion.author in team:
             return True
+        if discussion.author == agent:
+            details = huggingface_api.get_discussion_details(
+                proposal.model_id, discussion.num
+            )
+            changed = "\n".join(
+                line for line in (details.diff or "").splitlines() if line[:1] in "+-"
+            )
+            if any(f"{field}:" in changed for field in proposal.metadata):
+                return True
     return False
 
 

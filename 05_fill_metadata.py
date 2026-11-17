@@ -353,7 +353,10 @@ if __name__ == "__main__":
             revise(huggingface_api, index, proposal, vocabulary, budget, agent_config)
         sys.exit()
 
-    collected = {m["id"]: m for m in json.load(open(SNIPPETS_PATH))}
+    # models with an open PR by the team get no proposals, so no LLM spend either
+    collected = {
+        m["id"]: m for m in json.load(open(SNIPPETS_PATH)) if not m.get("team_pr")
+    }
     model_ids = list(collected)
     results = json.loads(RESULTS_PATH.read_text()) if RESULTS_PATH.exists() else {}
     new_proposals, done = [], []

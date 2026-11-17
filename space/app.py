@@ -13,7 +13,7 @@ from diff_view import code_blocks, split_diff
 from huggingface_hub import HfApi, ModelCard
 
 from configuration import AgentConfig, ExecuteCodeConfig
-from orchestrator import launch, launch_revision
+from orchestrator import launch, launch_revision, running_sweep
 from proposals import add_comment, decide
 from snippet_runner import LOG_BEGIN, LOG_END, RESULT_MARKER
 from state import load_agent_config, read, update_settings
@@ -217,22 +217,41 @@ def reject_proposal(choice, profile: gr.OAuthProfile | None):
     return _decide(choice, False, profile)
 
 
-def save_settings(auto_open, per_task, cap, tasks, profile: gr.OAuthProfile | None):
+def save_settings(auto_open, top_n, cap, profile: gr.OAuthProfile | None):
     _check(profile)
     changes = {
         "auto_open_prs": auto_open,
-        "num_trending_models_per_task": int(per_task),
+        "top_n": int(top_n),
         "max_cost_per_run_usd": float(cap),
-        "tasks": [t.strip() for t in tasks.split(",") if t.strip()] or None,
     }
     update_settings(huggingface_api, changes, profile.username)
     return "Saved"
 
 
-def run_now(profile: gr.OAuthProfile | None):
+def _start(profile, **params) -> str:
     _check(profile)
-    run_id, job_url = launch(huggingface_api, load_agent_config(huggingface_api))
-    return f"Started sweep `{run_id}` ([job]({job_url}))"
+    config = load_agent_config(huggingface_api)
+    if running := running_sweep(huggingface_api, config):
+        raise gr.Error(
+            f"Sweep {running} is still running; start a new one after its report."
+        )
+    run_id, job_url = launch(
+        huggingface_api, config, started_by=profile.username, **params
+    )
+    return f"Started `{run_id}` ([job]({job_url})). The report will be posted to Slack when it finishes."
+
+
+def start_sweep(top_n, force, reason, profile: gr.OAuthProfile | None):
+    if force and not reason.strip():
+        raise gr.Error(
+            "Say why the sweep is forced (which breaking change, who asked)."
+        )
+    return _start(profile, top_n=int(top_n), force=force, reason=reason.strip() or None)
+
+
+def start_task_sweep(tasks, per_task, profile: gr.OAuthProfile | None):
+    tasks = [t.strip() for t in tasks.split(",") if t.strip()] or ["all"]
+    return _start(profile, tasks=tasks, per_task=int(per_task))
 
 
 def refresh():
@@ -243,9 +262,8 @@ def refresh():
         *[""] * 7,
         gr.update(choices=[GENERAL], value=GENERAL),
         config.auto_open_prs,
-        config.num_trending_models_per_task,
+        config.top_n,
         config.max_cost_per_run_usd,
-        ", ".join(config.tasks or []),
     )
 
 
@@ -305,17 +323,40 @@ with gr.Blocks(title="Metadata agent") as demo:
         reject.click(reject_proposal, choice, [choice, outcome])
     with gr.Tab("Settings"):
         auto_open = gr.Checkbox(label="Open PRs without approval")
-        per_task = gr.Number(label="Trending models per task", precision=0)
+        top_n = gr.Number(label="Default sweep size (top N trending)", precision=0)
         cap = gr.Number(label="Cost cap per run (USD)")
-        tasks = gr.Textbox(label="Tasks (comma separated, empty: all)")
         saved = gr.Markdown()
-        gr.Button("Save").click(save_settings, [auto_open, per_task, cap, tasks], saved)
+        gr.Button("Save").click(save_settings, [auto_open, top_n, cap], saved)
     with gr.Tab("Run"):
-        started = gr.Markdown()
-        gr.Button("Run the agent now", variant="primary").click(run_now, None, started)
+        gr.Markdown(
+            "### Sweep\nThe top N of the Hub's main trending list. "
+            "Models checked before at the same commit are skipped."
+        )
+        sweep_n = gr.Number(value=AgentConfig().top_n, label="Top N", precision=0)
+        force = gr.Checkbox(
+            label="Force: re-check cached models too (after a breaking change on the Hub)"
+        )
+        reason = gr.Textbox(label="Why force? (required when forcing)", lines=2)
+        sweep_button = gr.Button("Start sweep", variant="primary")
+        sweep_started = gr.Markdown()
+        sweep_button.click(start_sweep, [sweep_n, force, reason], sweep_started)
+        gr.Markdown(
+            "### Task sweep\nThe top N trending models of each task. Only available here."
+        )
+        tasks = gr.Textbox(
+            label="Tasks, comma separated (e.g. text-generation,image-classification); empty: every task"
+        )
+        per_task = gr.Number(
+            value=AgentConfig().num_trending_models_per_task,
+            label="Top N per task",
+            precision=0,
+        )
+        task_button = gr.Button("Start task sweep")
+        task_started = gr.Markdown()
+        task_button.click(start_task_sweep, [tasks, per_task], task_started)
 
     # proposals and settings change outside this page (scheduled sweeps, Slack), so never show stale ones
-    current = [choice, *details, auto_open, per_task, cap, tasks]
+    current = [choice, *details, auto_open, top_n, cap]
     demo.load(refresh, None, current)
     refresh_button.click(refresh, None, current)
 
