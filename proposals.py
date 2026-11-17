@@ -8,6 +8,7 @@ records every PR it opens for `07_track_prs.py`.
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 
 import requests
 from huggingface_hub import HfApi, metadata_update
@@ -175,6 +176,8 @@ def decide(huggingface_api: HfApi, index: int, approve: bool, decided_by: str) -
     proposal = proposals[index]
     if proposal["status"] != "pending":
         return f"Already {proposal['status']}."
+    if approve and any(c["status"] == "pending" for c in proposal.get("comments", [])):
+        return "A review comment is still being addressed by the agent; approve once it has replied."
     if approve:
         fields = {
             k: v for k, v in proposal.items() if k in Proposal.__dataclass_fields__
@@ -192,3 +195,80 @@ def decide(huggingface_api: HfApi, index: int, approve: bool, decided_by: str) -
         f"{proposal['status']} by {decided_by}",
     )
     return f"Opened {proposal['url']}" if approve else "Rejected"
+
+
+# --- review comments: operators comment on a proposal (optionally on a diff line), the agent revises it
+
+
+def add_comment(
+    huggingface_api: HfApi, index: int, author: str, line: str, text: str
+) -> dict:
+    """Records a review comment for the agent to address (see `--revise` in 05/06)."""
+    proposals = read(huggingface_api, "proposals.json", [])
+    proposal = proposals[index]
+    if proposal["status"] != "pending":
+        raise ValueError(f"proposal is already {proposal['status']}")
+    comment = {
+        "id": len(proposal.setdefault("comments", [])) + 1,
+        "author": author,
+        "line": line,
+        "text": text,
+        "at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+    proposal["comments"].append(comment)
+    write(
+        huggingface_api,
+        "proposals.json",
+        proposals,
+        f"Review comment on #{index} by {author}",
+    )
+    return comment
+
+
+def with_pending_comments(proposals: list[dict], kind: str) -> list[tuple[int, dict]]:
+    return [
+        (i, p)
+        for i, p in enumerate(proposals)
+        if p["kind"] == kind
+        and p["status"] == "pending"
+        and any(c["status"] == "pending" for c in p.get("comments", []))
+    ]
+
+
+def resolve_comments(
+    huggingface_api: HfApi, index: int, reply: str, revised: Proposal | None
+):
+    """Replies to the pending comments and, if the agent revised the proposal, replaces its content."""
+    proposals = read(
+        huggingface_api, "proposals.json", []
+    )  # re-read: the Space may have written meanwhile
+    proposal = proposals[index]
+    if revised is not None:
+        proposal.setdefault("revisions", []).append(
+            {
+                k: proposal[k]
+                for k in ("metadata", "description", "evidence")
+                if k in proposal
+            }
+        )
+        proposal.update(
+            metadata=revised.metadata,
+            title=revised.title,
+            description=revised.description,
+            evidence=revised.evidence,
+        )
+    revision = len(proposal.get("revisions", []))
+    for comment in proposal.get("comments", []):
+        if comment["status"] == "pending":
+            comment.update(
+                status="addressed" if revised else "answered",
+                reply=reply,
+                revision=revision,
+            )
+    write(
+        huggingface_api,
+        "proposals.json",
+        proposals,
+        f"Agent replied to review on #{index}",
+    )

@@ -4,21 +4,22 @@ Approval Space for the metadata agent (sign in with Hugging Face; only
 agent's toggles, and start a run now.
 """
 
-import difflib
 import json
 import re
 
 import gradio as gr
 import yaml
+from diff_view import code_blocks, split_diff
 from huggingface_hub import HfApi, ModelCard
 
 from configuration import AgentConfig, ExecuteCodeConfig
-from orchestrator import launch
-from proposals import decide
+from orchestrator import launch, launch_revision
+from proposals import add_comment, decide
 from snippet_runner import LOG_BEGIN, LOG_END, RESULT_MARKER
 from state import load_agent_config, read, update_settings
 
 huggingface_api = HfApi()  # HF_TOKEN Space secret
+GENERAL = "General comment"
 
 
 def _check(profile: gr.OAuthProfile | None):
@@ -58,31 +59,23 @@ def checks_section(evidence: dict) -> str:
     return "| Snippet | Result | Detail | Job |\n|---|---|---|---|\n" + "\n".join(rows)
 
 
-def _diff(before: str, after: str, before_name: str, after_name: str) -> str:
-    lines = difflib.unified_diff(
-        before.splitlines(), after.splitlines(), before_name, after_name, lineterm=""
-    )
-    return "```diff\n" + ("\n".join(lines) or "(no change)") + "\n```"
-
-
-def snippet_diff_section(evidence: dict) -> str:
+def snippet_diff_section(evidence: dict) -> tuple[str, list[str]]:
     if "snippet_before" in evidence:
-        return _diff(
+        return split_diff(
             evidence["snippet_before"],
             evidence["snippet_after"],
-            "snippet (now)",
-            "snippet (with this PR)",
+            "Snippet now",
+            "Snippet with this PR",
         )
     snippets = evidence.get("snippets") or []
-    if not snippets:
-        return "This proposal does not change a snippet."
     return (
-        "This proposal does not change the snippets. The snippets that were checked:\n\n"
-        + "\n\n".join(f"```python\n{code}\n```" for code in snippets)
-    )
+        code_blocks(snippets)
+        if snippets
+        else "<p>This proposal does not change a snippet.</p>"
+    ), []
 
 
-def metadata_diff_section(p: dict) -> str:
+def metadata_diff_section(p: dict) -> tuple[str, list[str]]:
     """Front matter now vs. with this PR, computed against the current model card."""
     current = ModelCard.load(p["model_id"], token=huggingface_api.token).data.to_dict()
     proposed = dict(current)
@@ -90,9 +83,30 @@ def metadata_diff_section(p: dict) -> str:
         if p["overwrite"] or not proposed.get(key):
             proposed[key] = value
     dump = lambda data: yaml.safe_dump(data, sort_keys=False, allow_unicode=True)  # noqa: E731
-    return _diff(
-        dump(current), dump(proposed), "README.md (now)", "README.md (with this PR)"
+    return split_diff(
+        dump(current), dump(proposed), "README.md now", "README.md with this PR"
     )
+
+
+def thread_section(p: dict) -> str:
+    comments = p.get("comments") or []
+    if not comments:
+        return "_No review comments yet. Comment below and the agent will revise the proposal._"
+    status = {
+        "pending": "⏳ agent is working on it",
+        "addressed": "✅ revised",
+        "answered": "💬 answered",
+    }
+    parts = []
+    for c in comments:
+        part = f"**#{c['id']} · @{c['author']}** on `{c['line']}` · {c['at'][:16].replace('T', ' ')} · {status[c['status']]}\n> {c['text']}"
+        if c.get("reply"):
+            revision = (
+                f" (revision {c['revision']})" if c["status"] == "addressed" else ""
+            )
+            part += f"\n\n🤖 **Agent**{revision}: " + c["reply"].replace("\n", "\n\n")
+        parts.append(part)
+    return "\n\n---\n\n".join(parts)
 
 
 ANSI_CODES = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -148,17 +162,42 @@ def logs_section(evidence: dict) -> str:
 
 def show(choice):
     if not choice:
-        return [""] * 6
+        return [""] * 7 + [gr.update(choices=[GENERAL], value=GENERAL)]
     index = int(choice.split(":")[0])
     p = read(huggingface_api, "proposals.json", [])[index]
     evidence = p.get("evidence") or {}
+    snippet_diff, snippet_lines = snippet_diff_section(evidence)
+    metadata_diff, metadata_lines = metadata_diff_section(p)
+    lines = (
+        [GENERAL]
+        + [f"snippet {line}" for line in snippet_lines]
+        + [f"README {line}" for line in metadata_lines]
+    )
     return (
         summary_section(index, p),
         checks_section(evidence),
-        snippet_diff_section(evidence),
-        metadata_diff_section(p),
+        snippet_diff,
+        metadata_diff,
         logs_section(evidence),
         p["description"],
+        thread_section(p),
+        gr.update(choices=lines, value=GENERAL),
+    )
+
+
+def comment(choice, line, text, profile: gr.OAuthProfile | None):
+    """Records the comment and starts a job in which the agent revises the proposal."""
+    _check(profile)
+    if not choice or not text.strip():
+        raise gr.Error("Pick a proposal and write a comment.")
+    index = int(choice.split(":")[0])
+    add_comment(huggingface_api, index, profile.username, line, text.strip())
+    job_url = launch_revision(huggingface_api, load_agent_config(huggingface_api))
+    message = f"The agent is revising the proposal ([job]({job_url})). Refresh in a few minutes to see its reply."
+    return (
+        thread_section(read(huggingface_api, "proposals.json", [])[index]),
+        "",
+        message,
     )
 
 
@@ -201,7 +240,8 @@ def refresh():
     config = load_agent_config(huggingface_api)
     return (
         gr.update(choices=pending_choices(), value=None),
-        *[""] * 6,
+        *[""] * 7,
+        gr.update(choices=[GENERAL], value=GENERAL),
         config.auto_open_prs,
         config.num_trending_models_per_task,
         config.max_cost_per_run_usd,
@@ -222,14 +262,33 @@ with gr.Blocks(title="Metadata agent") as demo:
         with gr.Accordion("Snippet check", open=True):
             checks = gr.Markdown()
         with gr.Accordion("Snippet diff", open=True):
-            snippet_diff = gr.Markdown()
+            snippet_diff = gr.HTML()
         with gr.Accordion("Metadata diff (README front matter)", open=True):
-            metadata_diff = gr.Markdown()
+            metadata_diff = gr.HTML()
         with gr.Accordion("Job logs", open=False):
             logs = gr.Code(language=None, lines=20, interactive=False)
         with gr.Accordion("PR description", open=False):
             description = gr.Markdown()
-        details = [summary, checks, snippet_diff, metadata_diff, logs, description]
+        with gr.Accordion("Review", open=True):
+            thread = gr.Markdown()
+            line = gr.Dropdown([GENERAL], value=GENERAL, label="Comment on")
+            comment_text = gr.Textbox(
+                label="Comment",
+                lines=3,
+                placeholder="e.g. drop the license, it is not stated for this checkpoint",
+            )
+            comment_button = gr.Button("Comment and ask the agent to revise")
+            comment_status = gr.Markdown()
+        details = [
+            summary,
+            checks,
+            snippet_diff,
+            metadata_diff,
+            logs,
+            description,
+            thread,
+            line,
+        ]
         with gr.Row():
             approve, reject = (
                 gr.Button("Approve and open PR", variant="primary"),
@@ -237,6 +296,11 @@ with gr.Blocks(title="Metadata agent") as demo:
             )
         outcome = gr.Markdown()
         choice.change(show, choice, details)
+        comment_button.click(
+            comment,
+            [choice, line, comment_text],
+            [thread, comment_text, comment_status],
+        )
         approve.click(approve_proposal, choice, [choice, outcome])
         reject.click(reject_proposal, choice, [choice, outcome])
     with gr.Tab("Settings"):

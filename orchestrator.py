@@ -9,6 +9,7 @@ model) that tags its proposals and its stats in the agent state (`runs/<id>.json
 
     python orchestrator.py sweep             # sweep now
     python orchestrator.py run <model-id>    # check one model now
+    python orchestrator.py revise            # address review comments from the approval Space
     python orchestrator.py schedule          # scheduled sweeps (AgentConfig.schedule)
 """
 
@@ -25,6 +26,8 @@ from state import write
 
 load_dotenv()
 
+# answers review comments left in the approval Space
+REVISE_STAGES = ["06_repair_snippets.py --revise", "05_fill_metadata.py --revise"]
 STAGES = [
     "02_process_code.py",
     "03_run_jobs.py",
@@ -39,9 +42,9 @@ def new_run_id(kind: str) -> str:
     return f"{kind}-{datetime.now(timezone.utc):%Y%m%d-%H%M}-{secrets.token_hex(2)}"
 
 
-def _job_kwargs(config: AgentConfig, env: dict) -> dict:
+def _job_kwargs(config: AgentConfig, env: dict, stages: list[str] = STAGES) -> dict:
     # a failing stage must not stop PR tracking and the report, so stages run with `;`
-    stages = "; ".join(f"python {stage}" for stage in STAGES)
+    stages = "; ".join(f"python {stage}" for stage in stages)
     # scheduled runs get their ID when they start
     run_id = 'export RUN_ID="${RUN_ID:-sweep-$(date -u +%Y%m%d-%H%M)-$(printf %04x $RANDOM)}"'
     return dict(
@@ -81,6 +84,13 @@ def launch(
     return run_id, job.url
 
 
+def launch_revision(huggingface_api: HfApi, config: AgentConfig) -> str:
+    """Starts a job that addresses all pending review comments; returns its URL."""
+    return huggingface_api.run_job(
+        **_job_kwargs(config, {"RUN_ID": new_run_id("revise")}, REVISE_STAGES)
+    ).url
+
+
 def schedule_sweeps(huggingface_api: HfApi, config: AgentConfig):
     return huggingface_api.create_scheduled_job(
         schedule=config.schedule, **_job_kwargs(config, {})
@@ -93,5 +103,7 @@ if __name__ == "__main__":
     action = sys.argv[1]
     if action == "schedule":
         print(schedule_sweeps(huggingface_api, config))
+    elif action == "revise":
+        print(launch_revision(huggingface_api, config))
     else:
         print(launch(huggingface_api, config, sys.argv[2] if action == "run" else None))
