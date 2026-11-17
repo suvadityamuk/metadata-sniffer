@@ -6,6 +6,7 @@ agent's toggles, and start a run now.
 
 import difflib
 import json
+import re
 
 import gradio as gr
 import yaml
@@ -94,13 +95,23 @@ def metadata_diff_section(p: dict) -> str:
     )
 
 
+ANSI_CODES = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _clean(line: str) -> str:
+    """Progress bars redraw with carriage returns and colour codes: keep only what was last shown."""
+    return ANSI_CODES.sub("", line.rstrip("\n").split("\r")[-1])
+
+
 def snippet_logs(job_id: str, log_id: str) -> str:
     """The snippet's own stdout/stderr from its job, plus its result line."""
     lines = huggingface_api.fetch_job_logs(
         job_id=job_id, namespace=ExecuteCodeConfig().jobs_namespace
     )
     out, block = [], None
-    for line in (line.rstrip("\n") for line in lines):
+    for line in map(_clean, lines):
+        if not line.strip():
+            continue
         if line.startswith(LOG_BEGIN):
             model_id, index = line[len(LOG_BEGIN) :].rsplit(" ", 1)
             block = [f"----- snippet {index} -----"] if model_id == log_id else None
