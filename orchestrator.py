@@ -10,7 +10,7 @@ model) that tags its proposals and its stats in the agent state (`runs/<id>.json
     python orchestrator.py sweep [n]         # sweep the top n now
     python orchestrator.py run <model-id>    # check one model now
     python orchestrator.py revise            # address review comments from the approval Space
-    python orchestrator.py schedule          # scheduled sweeps (AgentConfig.schedule)
+    python orchestrator.py schedule          # scheduled top-10 sweeps, created suspended (AgentConfig.schedule)
 """
 
 import os
@@ -129,8 +129,15 @@ def launch_revision(huggingface_api: HfApi, config: AgentConfig) -> str:
 
 
 def schedule_sweeps(huggingface_api: HfApi, config: AgentConfig):
+    """
+    The scheduled sweep: the top `scheduled_top_n` of the main trending list, cached models skipped, never forced.
+    Created suspended: it only starts running once someone resumes it on purpose.
+    """
     return huggingface_api.create_scheduled_job(
-        schedule=config.schedule, **_job_kwargs(config, {})
+        schedule=config.schedule,
+        suspend=True,
+        concurrency=False,  # never two scheduled sweeps at once
+        **_job_kwargs(config, {"TOP_N": str(config.scheduled_top_n)}),
     )
 
 

@@ -323,7 +323,7 @@ def help_message(args, user):
     config = AgentConfig()
     intro = (
         "*Metadata agent*: checks the *Use this model* snippets and README metadata of trending Hub models, "
-        f"and proposes fixes as PRs. Sweeps also run on their own, {config.schedule_text}."
+        f"and proposes fixes as PRs. Scheduled sweep: {config.schedule_text}."
     )
     if config.dry_run:
         intro += f"\n_Dry run: PRs can only be opened on repos under {', '.join(config.dry_run_namespaces)}._"

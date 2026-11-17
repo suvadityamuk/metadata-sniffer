@@ -111,9 +111,14 @@ class AgentConfig:
         "model-metadata/metadata-agent"  # private; the org has only the two operators
     )
     code_repo: str = "https://github.com/suvadityamuk/metadata-sniffer"
-    code_revision: str = "feat/sweep-controls"  # back to "main" once the fork PRs are merged
+    code_revision: str = (
+        "feat/sweep-controls"  # back to "main" once the fork PRs are merged
+    )
     schedule: str = (
         "0 7 * * 1-5"  # weekdays 07:00 UTC, like the trending-models workflow
     )
-    schedule_text: str = "weekdays at 07:00 UTC"  # `schedule`, for people
+    schedule_text: str = "top 10, weekdays at 07:00 UTC, paused for now"  # the scheduled sweep, for people
+    scheduled_top_n: int = (
+        10  # scheduled sweeps check only the top 10 of the main trending list
+    )
     run_timeout_h: int = 6
