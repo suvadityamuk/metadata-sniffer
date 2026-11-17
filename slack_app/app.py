@@ -3,26 +3,29 @@ Slack app for the metadata agent, over Socket Mode (no public URL needed).
 Only `AgentConfig.slack_operators` can use it.
 
     /metadata-agent help               what each command does
-    /metadata-agent sweep              sweep the trending models now
+    /metadata-agent sweep [n] [force]  sweep the top n trending models (passcode protected)
     /metadata-agent run <model-id>     check one model now
     /metadata-agent status [run-id]    recent runs, or one run's stats
     /metadata-agent pending            proposals awaiting approval, with Approve / Reject buttons
     /metadata-agent settings           current settings
-    /metadata-agent set <key> <value>  auto on|off · per-task N · cap USD · tasks a,b|all
+    /metadata-agent set <key> <value>  auto on|off · top-n N · cap USD
 """
 
+import hmac
 import json
 import logging
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import requests
 from huggingface_hub import HfApi
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from configuration import AgentConfig
-from orchestrator import launch
+from orchestrator import launch, running_sweep
 from proposals import decide
 from state import load_agent_config, read, update_settings
 
@@ -32,21 +35,151 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 # `set` keys -> (setting, parser)
 SETTINGS = {
     "auto": ("auto_open_prs", lambda v: {"on": True, "off": False}[v]),
-    "per-task": ("num_trending_models_per_task", int),
+    "top-n": ("top_n", int),
     "cap": ("max_cost_per_run_usd", float),
-    "tasks": (
-        "tasks",
-        lambda v: None if v == "all" else [t for t in v.split(",") if t],
-    ),
 }
+MAX_PASSCODE_FAILURES = 5  # per user, then sweeps from Slack are locked for an hour
+passcode_failures: dict[str, list[float]] = {}
 
 
 def sweep(args, user):
-    run_id, job_url = launch(huggingface_api, load_agent_config(huggingface_api))
-    return {
-        "response_type": "in_channel",  # sweeps and runs are announced to the channel
-        "text": f"<@{user}> started sweep `{run_id}` (<{job_url}|job>). The report will be posted when it finishes.",
+    """`sweep [n] [force]` previews the sweep; its button asks for the passcode before anything starts."""
+    config = load_agent_config(huggingface_api)
+    force = "force" in args
+    numbers = [a for a in args if a.isdigit()]
+    if len(numbers) + force != len(args) or len(numbers) > 1:
+        return {
+            "text": "Usage: `/metadata-agent sweep [n] [force]`, e.g. `/metadata-agent sweep 50`"
+        }
+    top_n = int(numbers[0]) if numbers else config.top_n
+    if not 1 <= top_n <= config.max_top_n:
+        return {"text": f"n must be between 1 and {config.max_top_n}."}
+    if not os.environ.get("SWEEP_PASSCODE"):
+        return {
+            "text": "Sweeps from Slack are disabled until a passcode is configured (SWEEP_PASSCODE)."
+        }
+    if running := running_sweep(huggingface_api, config):
+        return {
+            "text": f"Sweep `{running}` is still running; start a new one after its report."
+        }
+    cache = "*re-checked* (forced)" if force else "skipped"
+    preview = (
+        f"*Sweep the top {top_n} trending models*{' · forced' if force else ''}\n"
+        f"Models already checked at their current commit are {cache}. "
+        f"Cost cap ${config.max_cost_per_run_usd} (HF Jobs + LLM). "
+        f"{'Dry run: PRs only on ' + ', '.join(config.dry_run_namespaces) + '. ' if config.dry_run else ''}"
+        f"PRs {'open without approval' if config.auto_open_prs else 'wait for approval'}."
+    )
+    button = {
+        "type": "button",
+        "text": {"type": "plain_text", "text": "Start sweep…"},
+        "style": "danger" if force else "primary",
+        "action_id": "confirm_sweep",
+        "value": json.dumps({"top_n": top_n, "force": force}),
     }
+    return {
+        "text": f"Sweep the top {top_n}",
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": preview}},
+            {"type": "actions", "elements": [button]},
+        ],
+    }
+
+
+@app.action("confirm_sweep")
+def ask_passcode(ack, body, client):
+    ack()
+    if body["user"]["id"] not in AgentConfig().slack_operators:
+        return
+    params = json.loads(body["actions"][0]["value"])
+    blocks = [
+        {
+            "type": "input",
+            "block_id": "passcode",
+            "label": {"type": "plain_text", "text": "Passcode"},
+            "element": {"type": "plain_text_input", "action_id": "value"},
+        }
+    ]
+    if params[
+        "force"
+    ]:  # forced sweeps re-check everything: say why, it is kept with the run
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": "reason",
+                "label": {
+                    "type": "plain_text",
+                    "text": "Why force? (breaking change, who asked)",
+                },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "value",
+                    "multiline": True,
+                },
+            }
+        )
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type": "modal",
+            "callback_id": "start_sweep",
+            "title": {"type": "plain_text", "text": "Start sweep"},
+            "submit": {"type": "plain_text", "text": "Start"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "private_metadata": json.dumps(
+                {**params, "response_url": body["response_url"]}
+            ),
+            "blocks": blocks,
+        },
+    )
+
+
+@app.view("start_sweep")
+def start_sweep(ack, body, view):
+    user, now = body["user"]["id"], time.time()
+    failures = [t for t in passcode_failures.get(user, []) if now - t < 3600]
+    values = view["state"]["values"]
+    passcode = values["passcode"]["value"]["value"] or ""
+    if (
+        user not in AgentConfig().slack_operators
+        or len(failures) >= MAX_PASSCODE_FAILURES
+    ):
+        ack(
+            response_action="errors",
+            errors={"passcode": "Too many wrong passcodes; try again in an hour."},
+        )
+        return
+    if not hmac.compare_digest(
+        passcode.encode(), os.environ["SWEEP_PASSCODE"].encode()
+    ):
+        passcode_failures[user] = [*failures, now]
+        ack(response_action="errors", errors={"passcode": "Wrong passcode."})
+        return
+    ack()  # closes the dialog; the sweep is announced through the original command's response URL
+    params = json.loads(view["private_metadata"])
+    config = load_agent_config(huggingface_api)
+    if running := running_sweep(huggingface_api, config):
+        message = {
+            "response_type": "ephemeral",
+            "text": f"Sweep `{running}` is still running; not starting another.",
+        }
+    else:
+        reason = (values.get("reason") or {}).get("value", {}).get("value")
+        run_id, job_url = launch(
+            huggingface_api,
+            config,
+            top_n=params["top_n"],
+            force=params["force"],
+            reason=reason,
+            started_by=f"slack:{user}",
+        )
+        kind = "a forced sweep" if params["force"] else "a sweep"
+        message = {
+            "response_type": "in_channel",  # sweeps and runs are announced to the channel
+            "text": f"<@{user}> started {kind} of the top {params['top_n']}: `{run_id}` (<{job_url}|job>). "
+            "The report will be posted when it finishes.",
+        }
+    requests.post(params["response_url"], json=message, timeout=10)
 
 
 def run(args, user):
@@ -133,8 +266,8 @@ def settings(args, user):
     config = load_agent_config(huggingface_api)
     return {
         "text": (
-            f"auto `{'on' if config.auto_open_prs else 'off'}` · per-task `{config.num_trending_models_per_task}` · "
-            f"cap `${config.max_cost_per_run_usd}` · tasks `{','.join(config.tasks or ['all'])}` · "
+            f"auto `{'on' if config.auto_open_prs else 'off'}` · top-n `{config.top_n}` · "
+            f"cap `${config.max_cost_per_run_usd}` · "
             f"dry run `{config.dry_run}` (PRs only on {config.dry_run_namespaces})"
         )
     }
@@ -151,13 +284,15 @@ def set_setting(args, user):
 # (usage, what it does, example); shown by `/metadata-agent help`
 HELP = [
     (
-        "sweep",
-        "Check the top trending models of every task now. Replies with a sweep ID.",
-        "sweep",
+        "sweep [n] [force]",
+        "Check the top n of the Hub's trending models now (default: the `top-n` setting). Shows what will run, "
+        "then asks for the passcode. Models checked before at the same commit are skipped; `force` re-checks "
+        "them (for breaking changes on the Hub) and asks why.",
+        "sweep 50",
     ),
     (
         "run <model-id>",
-        "Check one model now. Replies with a run ID.",
+        "Check one model now, cached or not. Replies with a run ID.",
         "run google/vit-base-patch16-224",
     ),
     (
@@ -173,9 +308,9 @@ HELP = [
     ("settings", "Current settings, including dry run.", "settings"),
     (
         "set <key> <value>",
-        "Change a setting: `auto on|off` (open PRs without approval), `per-task N`, "
-        "`cap USD` (cost cap per run), `tasks a,b|all`.",
-        "set per-task 3",
+        "Change a setting: `auto on|off` (open PRs without approval), `top-n N` (default sweep size), "
+        "`cap USD` (cost cap per run).",
+        "set top-n 30",
     ),
 ]
 

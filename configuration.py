@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 
 @dataclass
@@ -81,11 +81,15 @@ class ExecuteCodeConfig:
 class AgentConfig:
     # False: proposed PRs are posted to Slack for approval first; True: opened directly
     auto_open_prs: bool = False
-    num_trending_models_per_task: int = 5
+    top_n: int = 20  # sweeps: top N of the Hub's main trending list (`/metadata-agent sweep [n]`)
+    max_top_n: int = 200  # largest sweep that can be asked for
+    num_trending_models_per_task: int = 5  # task sweeps (approval Space only)
     max_snippet_runs: int = 3  # original run + 2 repair attempts
     max_cost_per_run_usd: float = 10.0
-    tasks: Optional[List[str]] = None  # None: every Hub task
-    recheck_after_days: int = 7  # unchanged models checked more recently are skipped
+    # an open PR by any of these on a model: the agent proposes nothing there and reports their PR
+    team_pr_authors: List[str] = field(
+        default_factory=lambda: ["linoyts", "ariG23498", "Steveeeeeeen"]
+    )
     llm_model: str = "moonshotai/Kimi-K3.1-Pro"
     llm_max_tokens: int = 24000  # Kimi reasons at length on long READMEs
     llm_max_call_usd: float = 0.20  # reserved per call, settled with the reported cost
@@ -103,9 +107,11 @@ class AgentConfig:
     state_repo: str = (
         "suvadityamuk/metadata-agent-state"  # private dataset, see state.py
     )
-    approval_space: str = "model-metadata/metadata-agent"  # private; the org has only the two operators
+    approval_space: str = (
+        "model-metadata/metadata-agent"  # private; the org has only the two operators
+    )
     code_repo: str = "https://github.com/suvadityamuk/metadata-sniffer"
-    code_revision: str = "feat/slack-app"  # back to "main" once the fork PRs are merged
+    code_revision: str = "feat/sweep-controls"  # back to "main" once the fork PRs are merged
     schedule: str = (
         "0 7 * * 1-5"  # weekdays 07:00 UTC, like the trending-models workflow
     )

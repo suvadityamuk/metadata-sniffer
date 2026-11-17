@@ -14,12 +14,7 @@ from huggingface_hub import HfApi
 from configuration import AgentConfig
 
 # toggles that can be changed from the Space; everything else stays in code
-EDITABLE_SETTINGS = (
-    "auto_open_prs",
-    "num_trending_models_per_task",
-    "max_cost_per_run_usd",
-    "tasks",
-)
+EDITABLE_SETTINGS = ("auto_open_prs", "top_n", "max_cost_per_run_usd")
 
 
 def read(huggingface_api: HfApi, name: str, default):

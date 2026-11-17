@@ -325,7 +325,7 @@ if __name__ == "__main__":
     failures = {
         (model_id, r["index"]): {**r, "job_id": entry["job_id"]}
         for model_id, entry in report.items()
-        if entry["status"] == "failed"
+        if entry["status"] == "failed" and not collected[model_id].get("team_pr")
         for r in entry["results"]
         if r["exit_code"] not in (0, None)
     }
