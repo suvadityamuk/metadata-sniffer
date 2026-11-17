@@ -17,7 +17,13 @@ from configuration import AgentConfig
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
-SHARED_MODULES = ["configuration.py", "orchestrator.py", "proposals.py", "snippet_runner.py", "state.py"]
+SHARED_MODULES = [
+    "configuration.py",
+    "orchestrator.py",
+    "proposals.py",
+    "snippet_runner.py",
+    "state.py",
+]
 TARGETS = {
     # space id, sdk, folder uploaded to the Space root, extra files kept at their repo path, secrets
     "approval": (
@@ -32,7 +38,13 @@ TARGETS = {
         "docker",
         "slack_app",
         ["slack_app/app.py"],
-        ["HF_TOKEN", "EXP_SLACK_WEBHOOK_URL", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"],
+        [
+            "HF_TOKEN",
+            "EXP_SLACK_WEBHOOK_URL",
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+            "SWEEP_PASSCODE?",
+        ],
     ),
 }
 
@@ -45,8 +57,13 @@ if __name__ == "__main__":
     huggingface_api.update_repo_settings(
         space, private=True, repo_type="space"
     )  # stays private on redeploys
-    for name in secrets:
-        huggingface_api.add_space_secret(space, name, os.environ[name])
+    for name in secrets:  # `NAME?`: optional, set only when present (e.g. sweeps from Slack need SWEEP_PASSCODE)
+        if name.endswith("?") and name[:-1] not in os.environ:
+            print(f"{name[:-1]} not set; the Space works without it")
+            continue
+        huggingface_api.add_space_secret(
+            space, name.rstrip("?"), os.environ[name.rstrip("?")]
+        )
     huggingface_api.upload_folder(
         folder_path=ROOT / folder,
         repo_id=space,
